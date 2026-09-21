@@ -47,6 +47,25 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 a{color:var(--blue)}
 .empty{color:var(--muted);padding:10px 0}
 .mt{margin-top:10px}
+:root{--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;
+--good:#0ca30c;--warning:#fab219;--critical:#d03b3b;--grid:#2c2c2a;--axis:#383835;--muted:#898781;--track:#1d2a3a}
+.gauges{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+.gauge{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.gauge .k{color:var(--muted);font-size:12px}
+.gauge svg{display:block;width:100%;max-width:220px;margin:4px auto 0}
+.gauge .val{text-align:center;font-size:22px;font-weight:600;margin-top:-6px}
+.gauge .st{text-align:center;font-size:12px;color:var(--muted)}
+.meter{margin:10px 0 2px}.meter .top{display:flex;justify-content:space-between;font-size:12px;color:var(--muted)}
+.meter .top b{color:var(--text);font-size:14px}
+.meter .bar{height:10px;border-radius:5px;background:var(--track);margin-top:6px;overflow:hidden}
+.meter .fill{height:100%;border-radius:5px;background:var(--s1)}
+.chart{position:relative}.chart svg{display:block;width:100%}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--muted);margin-bottom:6px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.legend b{color:var(--text);font-weight:500;margin-left:4px}
+.tip{position:absolute;pointer-events:none;background:#0b1016;border:1px solid #2b3b4f;border-radius:8px;padding:8px 10px;
+font-size:12px;display:none;white-space:nowrap;z-index:2}.tip div{display:flex;align-items:center;gap:6px}
+.tip i{display:inline-block;width:8px;height:8px;border-radius:2px}
 .two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}
 section,.watch{min-width:0}
 @media(max-width:900px){.two{grid-template-columns:1fr}}
@@ -72,6 +91,38 @@ section,.watch{min-width:0}
     <div class="tile"><div class="k">Tradable after depth check</div><div class="v" id="t-trad">–</div></div>
     <div class="tile"><div class="k">Behind chain tip (median)</div><div class="v" id="t-lag">–</div></div>
   </div>
+
+  <section>
+    <h2>Live overview <span class="note" id="live-age"></span></h2>
+    <div class="gauges">
+      <div class="gauge"><div class="k">Behind chain tip (median, slots)</div><div id="g-lag"></div></div>
+      <div class="gauge"><div class="k">Best gap after fees right now</div><div id="g-gap"></div></div>
+      <div class="gauge"><div class="k">Rates</div>
+        <div class="meter" id="m-depth"></div><div class="meter" id="m-fast"></div><div class="meter" id="m-up"></div></div>
+    </div>
+    <p class="note">Rates are measurements, not profits: "tradable" means a simulated round trip would have cleared your costs.
+      "Closed within 1 slot" is how often someone else was faster than a home setup could possibly be.</p>
+  </section>
+
+  <div class="two">
+    <section>
+      <h2>Gap after fees per token (%)</h2>
+      <div class="chart" id="c-net"></div>
+      <p class="note">Dashed line: your minimum net gap. Below zero means fees are bigger than the price difference.</p>
+    </section>
+    <section>
+      <h2>Pool updates per minute</h2>
+      <div class="chart" id="c-upd"></div>
+      <p class="note">How busy the watched pools are. Drops to zero mean the data stream stalled.</p>
+    </section>
+  </div>
+
+  <section>
+    <h2>Open gaps right now</h2>
+    <div class="scroll"><table><thead><tr><th>Watch</th><th>Buy → sell</th><th>Open for</th><th>After fees</th><th>Depth check</th></tr></thead>
+      <tbody id="opengaps"></tbody></table></div>
+    <div id="opengaps-empty" class="empty">No gaps open. Prices across pools agree within fees.</div>
+  </section>
 
   <section>
     <h2>Watches</h2>
@@ -246,6 +297,126 @@ function renderTable(body, empty, rows, cells) {
   $(empty).style.display = rows.length ? "none" : "block";
 }
 
+const SVGNS = "http://www.w3.org/2000/svg";
+const sv = (tag, attrs = {}) => { const n = document.createElementNS(SVGNS, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); return n; };
+const SERIES = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"].map(v => getComputedStyle(document.documentElement).getPropertyValue(v).trim());
+const cssv = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const hhmm = t => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+
+function gauge(host, frac, text, status, statusColor) {
+  const W = 220, H = 118, cx = 110, cy = 108, r = 88, a = Math.PI * Math.max(0, Math.min(1, frac));
+  const arc = (from, to) => { const x1 = cx - r * Math.cos(from), y1 = cy - r * Math.sin(from), x2 = cx - r * Math.cos(to), y2 = cy - r * Math.sin(to);
+    return `M${x1} ${y1} A${r} ${r} 0 ${to - from > Math.PI ? 1 : 0} 1 ${x2} ${y2}`; };
+  const svg = sv("svg", {viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${text} ${status}`});
+  svg.append(sv("path", {d: arc(0, Math.PI), stroke: cssv("--track"), "stroke-width": 14, fill: "none", "stroke-linecap": "round"}));
+  if (a > 0.001) svg.append(sv("path", {d: arc(0, a), stroke: statusColor, "stroke-width": 14, fill: "none", "stroke-linecap": "round"}));
+  const dot = el("span", {text: "● ", "aria-hidden": "true"});
+  dot.style.color = statusColor;
+  host.replaceChildren(svg, el("div", {class: "val", text}), el("div", {class: "st"}, dot, status));
+}
+
+function meter(host, label, num, den, color, caption) {
+  const frac = den ? num / den : 0;
+  const fill = el("div", {class: "fill"});
+  fill.style.width = (frac * 100).toFixed(1) + "%";
+  fill.style.background = color;
+  host.replaceChildren(el("div", {class: "top"}, el("span", {text: label}), el("b", {text: den ? `${(frac * 100).toFixed(0)}%` : "–"})),
+    el("div", {class: "bar"}, fill), el("div", {class: "note", text: caption}));
+}
+
+function lineChart(host, series, opts = {}) {
+  const W = Math.max(300, host.clientWidth || 600), H = opts.height || 220, m = {l: 48, r: 14, t: 10, b: 24};
+  const all = series.flatMap(s => s.pts);
+  const legend = el("div", {class: "legend"}, series.map(s => {
+    const last = s.pts.length ? s.pts[s.pts.length - 1][1] : null;
+    return el("span", {}, (() => { const i = el("i"); i.style.background = s.color; return i; })(), s.name,
+      el("b", {text: last === null ? "–" : fmt(last, opts.digits ?? 3) + (opts.unit || "")}));
+  }));
+  if (all.length < 2) { host.replaceChildren(legend, el("div", {class: "empty", text: "Collecting data… (a point every 5 seconds)"})); return; }
+  const t0 = Math.min(...all.map(p => p[0])), t1 = Math.max(...all.map(p => p[0]));
+  let y0 = Math.min(0, ...all.map(p => p[1])), y1 = Math.max(opts.ref ?? 0, ...all.map(p => p[1]));
+  if (y1 - y0 < 1e-9) y1 = y0 + 1;
+  const pad = (y1 - y0) * 0.1; y1 += pad; if (y0 < 0) y0 -= pad;
+  const X = t => m.l + (t - t0) / Math.max(1, t1 - t0) * (W - m.l - m.r), Y = v => m.t + (1 - (v - y0) / (y1 - y0)) * (H - m.t - m.b);
+  const svg = sv("svg", {viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": opts.label || "chart"});
+  for (let i = 0; i <= 4; i++) {
+    const v = y0 + (y1 - y0) * i / 4, y = Y(v);
+    svg.append(sv("line", {x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: cssv("--grid"), "stroke-width": 1}));
+    const tx = sv("text", {x: m.l - 6, y: y + 4, "text-anchor": "end", fill: cssv("--muted"), "font-size": 11}); tx.textContent = fmt(v, opts.tickDigits ?? 2); svg.append(tx);
+  }
+  if (y0 < 0) svg.append(sv("line", {x1: m.l, x2: W - m.r, y1: Y(0), y2: Y(0), stroke: cssv("--axis"), "stroke-width": 1}));
+  for (let i = 0; i <= 3; i++) {
+    const t = t0 + (t1 - t0) * i / 3, tx = sv("text", {x: X(t), y: H - 6, "text-anchor": i === 0 ? "start" : i === 3 ? "end" : "middle", fill: cssv("--muted"), "font-size": 11});
+    tx.textContent = hhmm(t); svg.append(tx);
+  }
+  if (opts.ref !== undefined) svg.append(sv("line", {x1: m.l, x2: W - m.r, y1: Y(opts.ref), y2: Y(opts.ref), stroke: cssv("--muted"), "stroke-width": 1, "stroke-dasharray": "4 4"}));
+  for (const s of series) {
+    if (!s.pts.length) continue;
+    if (opts.area) svg.append(sv("path", {d: `M${X(s.pts[0][0])} ${Y(0)} ` + s.pts.map(p => `L${X(p[0])} ${Y(p[1])}`).join(" ") + ` L${X(s.pts[s.pts.length - 1][0])} ${Y(0)} Z`, fill: s.color, opacity: 0.18}));
+    svg.append(sv("path", {d: s.pts.map((p, i) => `${i ? "L" : "M"}${X(p[0])} ${Y(p[1])}`).join(" "), stroke: s.color, "stroke-width": 2, fill: "none", "stroke-linejoin": "round"}));
+  }
+  const cross = sv("line", {y1: m.t, y2: H - m.b, stroke: cssv("--muted"), "stroke-width": 1, visibility: "hidden"});
+  const dots = series.map(s => { const c = sv("circle", {r: 4, fill: s.color, stroke: "#121a23", "stroke-width": 2, visibility: "hidden"}); svg.append(c); return c; });
+  svg.append(cross);
+  const tip = el("div", {class: "tip"});
+  const overlay = sv("rect", {x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent"});
+  overlay.addEventListener("mousemove", ev => {
+    const box = svg.getBoundingClientRect(), tx = t0 + ((ev.clientX - box.left) * W / box.width - m.l) / (W - m.l - m.r) * (t1 - t0);
+    const rows = [];
+    series.forEach((s, i) => {
+      if (!s.pts.length) return;
+      let best = s.pts[0]; for (const p of s.pts) if (Math.abs(p[0] - tx) < Math.abs(best[0] - tx)) best = p;
+      dots[i].setAttribute("cx", X(best[0])); dots[i].setAttribute("cy", Y(best[1])); dots[i].setAttribute("visibility", "visible");
+      cross.setAttribute("x1", X(best[0])); cross.setAttribute("x2", X(best[0]));
+      const sw = el("i"); sw.style.background = s.color;
+      rows.push(el("div", {}, sw, `${s.name}: ${fmt(best[1], opts.digits ?? 3)}${opts.unit || ""}`));
+    });
+    cross.setAttribute("visibility", "visible");
+    tip.replaceChildren(el("div", {text: hhmm(tx) + (opts.ref !== undefined ? `  (threshold ${fmt(opts.ref, 2)}${opts.unit || ""})` : "")}), ...rows);
+    tip.style.display = "block";
+    const px = (ev.clientX - box.left), left = px > box.width / 2 ? px - tip.offsetWidth - 12 : px + 12;
+    tip.style.left = left + "px"; tip.style.top = "30px";
+  });
+  overlay.addEventListener("mouseleave", () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); dots.forEach(d => d.setAttribute("visibility", "hidden")); });
+  svg.append(overlay);
+  host.replaceChildren(legend, svg, tip);
+}
+
+function renderLive(s) {
+  const lat = s.latency;
+  if (lat) {
+    const v = lat.median_slots, [st, c] = v <= 1 ? ["Fast", cssv("--good")] : v <= 3 ? ["Slow", cssv("--warning")] : ["Lagging", cssv("--critical")];
+    gauge($("g-lag"), v / 6, `${v} slot${v === 1 ? "" : "s"}`, `${st} · p90 ${lat.p90_slots} · ${lat.same_slot_pct}% same slot`, c);
+  } else gauge($("g-lag"), 0, "–", "waiting for data", cssv("--muted"));
+  const nets = s.watches.map(w => w.net_gap_pct).filter(v => v !== null && v !== undefined);
+  const thr = s.min_net_gap_pct;
+  if (nets.length) {
+    const best = Math.max(...nets), who = s.watches.find(w => w.net_gap_pct === best);
+    const [st, c] = best >= thr ? ["Gap open", cssv("--good")] : best > 0 ? ["Below your threshold", cssv("--warning")] : ["No gap after fees", cssv("--muted")];
+    gauge($("g-gap"), Math.max(0, best) / (thr * 2), `${fmt(best, 3)}%`, `${st} · ${who ? who.label : ""} · threshold ${fmt(thr, 2)}%`, c);
+  } else gauge($("g-gap"), 0, "–", "waiting for data", cssv("--muted"));
+  const r = s.rates || {};
+  meter($("m-depth"), "Tradable after depth check", r.tradable || 0, r.checked || 0, cssv("--s1"), `${r.tradable || 0} of ${r.checked || 0} depth-checked gaps`);
+  meter($("m-fast"), "Closed within 1 slot", r.within_1_slot || 0, r.gaps || 0, cssv("--s1"), `${r.within_1_slot || 0} of ${r.gaps || 0} gaps (competition speed)`);
+  const h = s.history || [];
+  let live = 0; for (let i = 1; i < h.length; i++) if (h[i].updates > h[i - 1].updates) live++;
+  const upFrac = h.length > 1 ? live / (h.length - 1) : 0;
+  meter($("m-up"), "Data flowing", live, Math.max(0, h.length - 1), upFrac >= 0.95 ? cssv("--good") : upFrac >= 0.8 ? cssv("--warning") : cssv("--critical"),
+    `${live} of ${Math.max(0, h.length - 1)} samples had new data (last hour)`);
+  $("live-age").textContent = h.length ? `updated ${new Date().toLocaleTimeString()}` : "";
+  const labels = s.watches.map(w => w.label);
+  lineChart($("c-net"), labels.map((l, i) => ({name: l, color: SERIES[i % 8], pts: h.filter(p => p.net && p.net[l] !== undefined).map(p => [p.t, p.net[l]])})),
+    {unit: "%", ref: thr, label: "Gap after fees per token", tickDigits: 2});
+  const upd = [];
+  for (let i = 1; i < h.length; i++) { const dt = h[i].t - h[i - 1].t, du = h[i].updates - h[i - 1].updates; if (dt > 0) upd.push([h[i].t, Math.max(0, du / dt * 60)]); }
+  lineChart($("c-upd"), [{name: "Updates per minute", color: SERIES[0], pts: upd}], {digits: 0, tickDigits: 0, area: true, label: "Pool updates per minute"});
+  const now = Date.now() / 1000;
+  renderTable("opengaps", "opengaps-empty", s.open_gaps, g => [g.watch, `${g.buy} → ${g.sell}`, `${Math.round(now - g.since)} s`,
+    fmt(g.net_gap_pct, 3) + "%",
+    g.depth_best === null || g.depth_best === undefined ? "unknown (Meteora)"
+      : el("span", {class: g.depth_best >= g.min_profit ? "pos" : "neg", text: `${fmt(g.depth_best, 5)} SOL ${g.depth_best >= g.min_profit ? "tradable" : "not tradable"}`})]);
+}
+
 async function refresh() {
   let s;
   try { s = await api("/api/state"); } catch (e) { $("state").textContent = "offline"; $("state").className = "pill warn"; return; }
@@ -256,7 +427,7 @@ async function refresh() {
   $("t-gaps").textContent = fmt(s.stats.dislocations || 0, 0);
   $("t-open").textContent = s.watches.reduce((a, w) => a + w.open, 0);
   $("t-trad").textContent = fmt(s.stats.tradable || 0, 0);
-  $("t-lag").textContent = s.latency ? `${s.latency.median_slots} slots` : "–";
+  $("t-lag").textContent = s.latency ? `${s.latency.median_slots} slot${s.latency.median_slots === 1 ? "" : "s"}` : "–";
   $("alertpill").textContent = s.alerts_enabled ? "alerts on" : "alerts off";
   $("alertpill").className = "pill " + (s.alerts_enabled ? "ok" : "");
   const h = s.hunter;
@@ -270,6 +441,7 @@ async function refresh() {
   $("alert-status").textContent = s.alerts_enabled ? "Telegram alerts are on." : "Telegram alerts are off (not configured).";
   $("alert-list").replaceChildren(...(s.alerts.length ? s.alerts.map(a => el("div", {text: a})) : [el("div", {text: "No alerts yet."})]));
   renderWatches(s.watches);
+  renderLive(s);
   renderTable("gaps", "gaps-empty", s.dislocations, r => [r.opened_utc.replace("T", " ").slice(0, 19), r.watch,
     `${r.buy_pool} → ${r.sell_pool}`, r.slots_open, r.seconds_open, fmt(r.peak_gap_pct, 3) + "%",
     fmt(r.peak_net_gap_pct, 3) + "%",
@@ -314,7 +486,7 @@ $("test-alert").addEventListener("click", async () => {
 $("logout").addEventListener("click", async () => { try { await api("/api/logout", {}); } finally { location.href = "/login"; } });
 
 refresh(); loadReport();
-setInterval(refresh, 5000);
+setInterval(refresh, 3000);
 setInterval(loadReport, 60000);
 </script>
 </body>

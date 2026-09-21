@@ -710,6 +710,18 @@ class Engine:
     def open_count(self) -> int:
         return sum(len(w.open) for w in self.watches)
 
+    def best_net_gap_pct(self, w: Watch) -> float | None:
+        """Largest price gap between any two pools right now, after both fees (and the SOL/USDC fee)."""
+        pools = [(p, px) for p in w.pools if not p.suspect and (px := self.to_sol(w, p))]
+        best = None
+        for i in range(len(pools)):
+            for j in range(i + 1, len(pools)):
+                (a, pa), (b, pb) = pools[i], pools[j]
+                ref_fee = w.ref.fee if a.quote_mint != b.quote_mint and w.ref else 0.0
+                net = (max(pa, pb) / min(pa, pb)) * (1 - a.fee) * (1 - b.fee) * (1 - ref_fee) - 1
+                best = net if best is None else max(best, net)
+        return None if best is None else best * 100
+
     def max_gap_pct(self, w: Watch) -> float | None:
         prices = [s for p in w.pools if not p.suspect and (s := self.to_sol(w, p))]
         if len(prices) < 2:

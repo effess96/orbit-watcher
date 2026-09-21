@@ -22,6 +22,7 @@ import contextlib
 import csv
 import hashlib
 import hmac
+import html
 import io
 import json
 import os
@@ -92,7 +93,7 @@ def gecko_new_pools(fetch) -> list[dict]:
             liq = float(a.get("reserve_in_usd") or 0)
         except (TypeError, ValueError):
             liq = 0.0
-        out.append({"pool": a.get("address", ""), "name": a.get("name", "?"), "base": mint("base_token"),
+        out.append({"pool": a.get("address", ""), "name": html.unescape(a.get("name", "?")), "base": mint("base_token"),
                     "quote": mint("quote_token"), "liquidity_usd": liq})
     return out
 
@@ -166,6 +167,8 @@ class App:
         self.hunt_seen: set[str] = set()
         self.last_daily = time.time()
         self.last_hunt = 0.0
+        self.history: collections.deque = collections.deque(maxlen=720)   # 1 hour at 5-second samples
+        self._rates = {"t": 0.0}
 
     # -- config -------------------------------------------------------------
     def config(self) -> dict:
@@ -192,6 +195,7 @@ class App:
         self.loop = asyncio.get_running_loop()
         self.recorder = W.Recorder(self.out)
         await self.restart()
+        asyncio.get_running_loop().create_task(self._sample_loop())
         while True:
             await asyncio.sleep(30)
             self.maintain()
@@ -230,6 +234,51 @@ class App:
         except Exception as e:  # bad config etc.
             self.state = f"stopped: {e}"
             print(f"Watcher stopped: {e}")
+
+    async def _sample_loop(self, every: float = 5.0) -> None:
+        while True:
+            self.sample()
+            await asyncio.sleep(every)
+
+    def sample(self) -> None:
+        """One point for the live charts: gap per watch, total updates, latency."""
+        e = self.engine
+        if not e:
+            return
+        lat = e.latency_stats()
+        self.history.append({"t": round(time.time(), 1), "updates": e.updates,
+                             "lag": lat["median_slots"] if lat else None,
+                             "gaps": {w.label: round(g, 4) for w in e.watches
+                                      if (g := e.max_gap_pct(w)) is not None},
+                             "net": {w.label: round(g, 4) for w in e.watches
+                                     if (g := e.best_net_gap_pct(w)) is not None}})
+
+    def rates(self) -> dict:
+        """Depth-check pass rate and speed of closing, from the full CSV (cached 30 s)."""
+        if time.time() - self._rates["t"] < 30:
+            return self._rates
+        rows = W.read_csv(self.out / "dislocations.csv")
+        checked = [r for r in rows if r.get("tradable") in ("yes", "no")]
+        self._rates = {"t": time.time(), "gaps": len(rows), "checked": len(checked),
+                       "tradable": sum(r["tradable"] == "yes" for r in checked),
+                       "within_1_slot": sum(1 for r in rows if r.get("slots_open", "").isdigit()
+                                            and int(r["slots_open"]) <= 1)}
+        return self._rates
+
+    def open_gaps(self) -> list[dict]:
+        e, out = self.engine, []
+        if not e:
+            return out
+        for w in e.watches:
+            try:
+                items = list(w.open.values())
+            except RuntimeError:        # changed while reading; next poll catches it
+                continue
+            for g in items:
+                out.append({"watch": w.label, "buy": g["buy"], "sell": g["sell"], "since": g["start"],
+                            "net_gap_pct": round(g["peak_net_gap"] * 100, 4), "method": g["method"],
+                            "depth_best": g.get("depth_best"), "min_profit": w.min_profit_sol})
+        return out
 
     def _attach(self, engine) -> None:
         engine.on_event = self.handle_event
@@ -374,6 +423,7 @@ class App:
             watches.append({"label": wc["label"], **settings, "pools": pools, "auto_until": wc.get("auto_until"),
                             "ref": ref["name"] if ref else None,
                             "gap_pct": e.max_gap_pct(lw) if e and lw else None,
+                            "net_gap_pct": e.best_net_gap_pct(lw) if e and lw else None,
                             "open": len(lw.open) if lw else 0})
         return {
             "state": self.state, "uptime_s": round(time.time() - self.started),
@@ -381,6 +431,9 @@ class App:
             "stats": dict(e.stats) if e else {}, "watches": watches,
             "rpc": "private" if os.environ.get("SOLANA_RPC_HTTP") else "public",
             "latency": e.latency_stats() if e else None,
+            "history": list(self.history)[-720::2], "open_gaps": self.open_gaps(),
+            "rates": {k: v for k, v in self.rates().items() if k != "t"},
+            "min_net_gap_pct": min((w.min_net_gap * 100 for w in e.watches), default=0.2) if e else 0.2,
             "alerts_enabled": self.notifier.enabled, "alerts": list(self.alerts)[:10],
             "hunter": {**self.hunter_cfg(), "last_check": self.hunter["last_check"], "checked": self.hunter["checked"],
                        "recent": list(self.hunter["recent"]), "error": self.hunter["error"]},
