@@ -1,0 +1,22 @@
+{
+  "rpc_http": "https://api.mainnet-beta.solana.com",
+  "rpc_ws": "wss://api.mainnet-beta.solana.com",
+  "commitment": "processed",
+  "evaluate_delay_ms": 150,
+  "watches": [
+    {
+      "label": "EXAMPLE/SOL  (replace by running: python watcher.py discover <TOKEN_MINT> --write)",
+      "token_mint": "TOKEN_MINT_ADDRESS",
+      "quote_mint": "So11111111111111111111111111111111111111112",
+      "token_decimals": 6,
+      "quote_decimals": 9,
+      "cost_quote": 0.0005,
+      "min_profit_quote": 0.0005,
+      "shock_pct": 0.5,
+      "pools": [
+        {"name": "Raydium AMM v4 xxxx", "address": "POOL_ADDRESS_1", "base_vault": "TOKEN_VAULT_1", "quote_vault": "SOL_VAULT_1", "fee": 0.0025},
+        {"name": "PumpSwap yyyy", "address": "POOL_ADDRESS_2", "base_vault": "TOKEN_VAULT_2", "quote_vault": "SOL_VAULT_2", "fee": 0.003}
+      ]
+    }
+  ]
+}

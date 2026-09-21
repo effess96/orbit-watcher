@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Orbit Watcher</title>
+<style nonce="{{NONCE}}">
+:root{--bg:#0b1016;--panel:#121a23;--line:#223041;--text:#e6edf3;--muted:#8b9bb0;--green:#3ddc97;--red:#ff7b72;--amber:#e3b341;--blue:#79c0ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:16px 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:18px;letter-spacing:.14em;margin:0}
+header .sub{color:var(--muted);letter-spacing:.06em;font-size:12px}
+.spacer{flex:1}
+.pill{padding:3px 10px;border-radius:99px;font-size:12px;border:1px solid var(--line);color:var(--muted)}
+.pill.ok{color:var(--green);border-color:#1f5c43}.pill.warn{color:var(--amber);border-color:#5c4a1f}
+main{max-width:1200px;margin:0 auto;padding:20px 16px 60px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.tile .k{color:var(--muted);font-size:12px}.tile .v{font-size:24px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:18px}
+section h2{font-size:15px;margin:0 0 12px;display:flex;align-items:center;gap:10px}
+.note{color:var(--muted);font-size:12px;margin:6px 0 0}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:500;font-size:12px}
+.scroll{overflow-x:auto}
+input,button{font:inherit}
+input[type=text],input[type=number]{background:var(--bg);border:1px solid #2b3b4f;color:var(--text);border-radius:7px;padding:7px 9px}
+input[type=number]{width:110px}
+#mint{flex:1 1 260px;min-width:0;max-width:520px}
+button{background:#1c2733;color:var(--text);border:1px solid #2b3b4f;border-radius:7px;padding:7px 12px;cursor:pointer}
+button:hover{border-color:#3d526b}
+button.primary{background:var(--green);color:#06281a;border-color:var(--green);font-weight:600}
+button.danger{color:var(--red)}
+button:disabled{opacity:.5;cursor:wait}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.watch{border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
+.watch h3{margin:0;font-size:15px}
+.gap{font-size:13px;color:var(--muted)}.gap b{color:var(--text)}
+.settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:12px 0}
+.settings label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;white-space:pre-wrap;font-size:12.5px;margin:0}
+.log{max-height:260px;overflow:auto;font:12px/1.6 ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
+.pos{color:var(--green)}.neg{color:var(--red)}
+.msg{margin-top:10px;font-size:13px}.msg.err{color:var(--red)}
+a{color:var(--blue)}
+.empty{color:var(--muted);padding:10px 0}
+.mt{margin-top:10px}
+.two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}
+section,.watch{min-width:0}
+@media(max-width:900px){.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>ORBIT</h1><span class="sub">DISLOCATION WATCHER · READ-ONLY</span>
+  <span class="spacer"></span>
+  <span id="state" class="pill">…</span>
+  <span id="rpc" class="pill">RPC</span>
+  <span id="alertpill" class="pill">alerts off</span>
+  <button id="logout">Log out</button>
+</header>
+<main>
+  <div class="tiles">
+    <div class="tile"><div class="k">Uptime</div><div class="v" id="t-uptime">–</div></div>
+    <div class="tile"><div class="k">Pool updates</div><div class="v" id="t-updates">–</div></div>
+    <div class="tile"><div class="k">Latest slot</div><div class="v" id="t-slot">–</div></div>
+    <div class="tile"><div class="k">Shocks</div><div class="v" id="t-shocks">–</div></div>
+    <div class="tile"><div class="k">Profitable gaps closed</div><div class="v" id="t-gaps">–</div></div>
+    <div class="tile"><div class="k">Open right now</div><div class="v" id="t-open">–</div></div>
+    <div class="tile"><div class="k">Tradable after depth check</div><div class="v" id="t-trad">–</div></div>
+    <div class="tile"><div class="k">Behind chain tip (median)</div><div class="v" id="t-lag">–</div></div>
+  </div>
+
+  <section>
+    <h2>Watches</h2>
+    <div id="watches"></div>
+    <p class="note">Costs, minimum profit and fees are your assumptions. Saving restarts the watcher; gaps open at that moment are dropped, not mistimed.</p>
+  </section>
+
+  <div class="two">
+    <section>
+      <h2>New-pool hunter <button id="hunt-toggle">…</button></h2>
+      <div id="hunt-status" class="note"></div>
+      <div id="hunt-recent" class="log"></div>
+      <p class="note">Checks the newest Solana pools every 5 minutes. When a new token already has 2+ usable pools
+        (each above $10k), it is watched automatically for 30 minutes (max 3 at once). This is where ANB-type events happen.</p>
+    </section>
+    <section>
+      <h2>Alerts <button id="test-alert">Send test</button></h2>
+      <div id="alert-status" class="note"></div>
+      <div id="alert-list" class="log"></div>
+      <p class="note">Telegram alerts for gaps that pass the depth check and for single-update moves of 3%+.
+        Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway to turn them on.</p>
+    </section>
+  </div>
+
+  <section>
+    <h2>Add a token</h2>
+    <div class="row">
+      <input type="text" id="mint" placeholder="Token mint address" size="48" spellcheck="false">
+      <button id="discover" class="primary">Find pools</button>
+    </div>
+    <div id="disc"></div>
+  </section>
+
+  <div class="two">
+    <section>
+      <h2>Recent profitable gaps</h2>
+      <div class="scroll"><table><thead><tr><th>Opened (UTC)</th><th>Watch</th><th>Buy → sell</th><th>Slots</th><th>Seconds</th><th>Peak gap</th><th>After fees</th><th>Depth check</th></tr></thead><tbody id="gaps"></tbody></table></div>
+      <div id="gaps-empty" class="empty">None yet.</div>
+    </section>
+    <section>
+      <h2>Recent shocks</h2>
+      <div class="scroll"><table><thead><tr><th>Time (UTC)</th><th>Watch</th><th>Pool</th><th>Move</th><th>Gap visible?</th></tr></thead><tbody id="shocks"></tbody></table></div>
+      <div id="shocks-empty" class="empty">None yet.</div>
+    </section>
+  </div>
+
+  <section>
+    <h2>Report <button id="refresh-report">Refresh</button></h2>
+    <pre id="report">Loading…</pre>
+    <p class="note">Downloads: <a href="/download/dislocations.csv">dislocations.csv</a> · <a href="/download/shocks.csv">shocks.csv</a> · <a href="/download/raw_updates.jsonl">raw_updates.jsonl</a></p>
+  </section>
+
+  <section>
+    <h2>Activity</h2>
+    <div id="log" class="log"></div>
+  </section>
+</main>
+
+<script nonce="{{NONCE}}">
+const $ = id => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") n.className = v; else if (k === "text") n.textContent = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v);
+  }
+  kids.flat().forEach(k => n.append(k instanceof Node ? k : document.createTextNode(k)));
+  return n;
+};
+
+async function api(path, body) {
+  const opts = body === undefined ? {} : {method: "POST", headers: {"Content-Type": "application/json", "X-Orbit": "1"}, body: JSON.stringify(body)};
+  const r = await fetch(path, opts);
+  if (r.status === 401) { location.href = "/login"; throw new Error("login required"); }
+  const text = await r.text();
+  const data = path === "/api/report" ? text : JSON.parse(text || "{}");
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+const fmt = (n, d = 4) => n === null || n === undefined || n === "" ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d});
+const dur = s => { const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`; };
+
+let watchSig = "";
+const KIND = {cp: "constant product", whirlpool: "Orca Whirlpool", clmm: "Raydium CLMM", dlmm: "Meteora DLMM (fee + 1 bin)"};
+const pct = f => fmt(f * 100, 4) + "%";
+function renderWatches(ws) {
+  const sig = JSON.stringify(ws.map(w => [w.label, w.cost_sol, w.min_profit_sol, w.min_net_gap_pct, w.shock_pct,
+    w.pools.map(p => [p.name, p.fee_editable ? p.fee : null, p.suspect])]));
+  const box = $("watches");
+  if (sig === watchSig) {                       // only refresh live numbers, keep any typing intact
+    ws.forEach((w, i) => {
+      const card = box.children[i]; if (!card) return;
+      card.querySelector(".gapv").textContent = w.gap_pct === null ? "waiting for data" : fmt(w.gap_pct, 4) + "%";
+      card.querySelector(".openv").textContent = w.open;
+      w.pools.forEach((p, j) => {
+        const c = card.querySelectorAll(".price")[j]; if (c) c.textContent = p.price === null ? "–" : `${fmt(p.price, 10)} ${p.quote}`;
+        const f = card.querySelectorAll(".livefee")[j]; if (f && !p.fee_editable) f.textContent = pct(p.fee) + " live";
+      });
+    });
+    return;
+  }
+  watchSig = sig;
+  box.replaceChildren();
+  if (!ws.length) { box.append(el("div", {class: "empty", text: "No watches yet. Add a token below."})); return; }
+  for (const w of ws) {
+    const inputs = {};
+    const num = (key, step) => (inputs[key] = el("input", {type: "number", step, value: w[key]}));
+    const feeInputs = {};
+    const msg = el("div", {class: "msg"});
+    const rows = w.pools.map(p => el("tr", {},
+      el("td", {text: p.name + (p.suspect ? " (excluded: price looked wrong)" : "")}),
+      el("td", {text: KIND[p.kind] || p.kind}),
+      el("td", {class: "price", text: p.price === null ? "–" : `${fmt(p.price, 10)} ${p.quote}`}),
+      el("td", {class: "livefee"}, p.fee_editable
+        ? (feeInputs[p.name] = el("input", {type: "number", step: "0.0005", value: p.fee}))
+        : pct(p.fee) + " live"),
+      el("td", {class: p.liquidity_usd !== null && p.liquidity_usd !== undefined && p.liquidity_usd < 10000 ? "neg" : "",
+                text: p.liquidity_usd ? "$" + fmt(p.liquidity_usd, 0) : "–"}),
+      el("td", {}, el("button", {class: "danger", text: "Drop", title: "Stop watching this pool", onclick: async () => {
+        if (!confirm(`Drop pool ${p.name} from ${w.label}?`)) return;
+        try { await api("/api/watches/update", {label: w.label, remove_pools: [p.name]}); watchSig = ""; refresh(); }
+        catch (e) { msg.className = "msg err"; msg.textContent = e.message; }
+      }}))));
+    const save = el("button", {class: "primary", text: "Save", onclick: async () => {
+      save.disabled = true; msg.className = "msg"; msg.textContent = "Saving…";
+      try {
+        const fees = {}; for (const [n, i] of Object.entries(feeInputs)) fees[n] = i.value;
+        await api("/api/watches/update", {label: w.label, cost_sol: inputs.cost_sol.value,
+          min_profit_sol: inputs.min_profit_sol.value, min_net_gap_pct: inputs.min_net_gap_pct.value,
+          shock_pct: inputs.shock_pct.value, fees});
+        msg.textContent = "Saved. Watcher restarted."; watchSig = ""; refresh();
+      } catch (e) { msg.className = "msg err"; msg.textContent = e.message; }
+      save.disabled = false;
+    }});
+    const remove = el("button", {class: "danger", text: "Remove", onclick: async () => {
+      if (!confirm(`Stop watching ${w.label}?`)) return;
+      try { await api("/api/watches/remove", {label: w.label}); watchSig = ""; refresh(); }
+      catch (e) { msg.className = "msg err"; msg.textContent = e.message; }
+    }});
+    box.append(el("div", {class: "watch"},
+      el("div", {class: "row"}, el("h3", {text: w.label}),
+        w.auto_until ? el("span", {class: "pill warn", text: `hunter · ends in ${Math.max(0, Math.round((w.auto_until * 1000 - Date.now()) / 60000))} min`}) : "",
+        el("span", {class: "gap"}, "gap now ", el("b", {class: "gapv", text: w.gap_pct === null ? "waiting for data" : fmt(w.gap_pct, 4) + "%"})),
+        el("span", {class: "gap"}, "open ", el("b", {class: "openv", text: w.open})),
+        el("span", {class: "spacer"}), remove),
+      w.ref ? el("p", {class: "note", text: `USDC prices are converted to SOL with ${w.ref}.`}) : "",
+      el("div", {class: "scroll"}, el("table", {}, el("thead", {}, el("tr", {},
+        el("th", {text: "Pool"}), el("th", {text: "Type"}), el("th", {text: "Price"}), el("th", {text: "Fee (0.0025 = 0.25%)"}),
+        el("th", {text: "Liquidity"}), el("th", {text: ""}))),
+        el("tbody", {}, rows))),
+      el("div", {class: "settings"},
+        el("label", {}, "Cost per attempt (SOL)", num("cost_sol", "0.0001")),
+        el("label", {}, "Min net profit, Raydium/PumpSwap pairs (SOL)", num("min_profit_sol", "0.0001")),
+        el("label", {}, "Min net gap after fees, other pairs (%)", num("min_net_gap_pct", "0.05")),
+        el("label", {}, "Shock threshold (%)", num("shock_pct", "0.1"))),
+      el("div", {class: "row"}, save), msg));
+  }
+}
+
+function depthCell(r) {
+  if (r.tradable === "yes") {
+    const best = Math.max(...["depth_net_sol_0_25", "depth_net_sol_1", "depth_net_sol_5"].map(k => Number(r[k])));
+    return el("span", {class: "pos", text: `tradable, ${fmt(best, 5)} SOL`});
+  }
+  if (r.tradable === "no") return el("span", {class: "neg", text: "not tradable"});
+  return "unknown";
+}
+
+function renderTable(body, empty, rows, cells) {
+  $(body).replaceChildren(...rows.map(r => el("tr", {}, cells(r).map(c => c instanceof Node ? el("td", {}, c) : el("td", {text: c})))));
+  $(empty).style.display = rows.length ? "none" : "block";
+}
+
+async function refresh() {
+  let s;
+  try { s = await api("/api/state"); } catch (e) { $("state").textContent = "offline"; $("state").className = "pill warn"; return; }
+  $("state").textContent = s.state; $("state").className = "pill " + (s.state === "running" ? "ok" : "warn");
+  $("rpc").textContent = s.rpc === "private" ? "private RPC" : "public RPC";
+  $("t-uptime").textContent = dur(s.uptime_s); $("t-updates").textContent = fmt(s.updates, 0);
+  $("t-slot").textContent = s.slot ? s.slot : "–"; $("t-shocks").textContent = fmt(s.stats.shocks || 0, 0);
+  $("t-gaps").textContent = fmt(s.stats.dislocations || 0, 0);
+  $("t-open").textContent = s.watches.reduce((a, w) => a + w.open, 0);
+  $("t-trad").textContent = fmt(s.stats.tradable || 0, 0);
+  $("t-lag").textContent = s.latency ? `${s.latency.median_slots} slots` : "–";
+  $("alertpill").textContent = s.alerts_enabled ? "alerts on" : "alerts off";
+  $("alertpill").className = "pill " + (s.alerts_enabled ? "ok" : "");
+  const h = s.hunter;
+  $("hunt-toggle").textContent = h.enabled ? "Turn off" : "Turn on";
+  $("hunt-toggle").dataset.on = h.enabled ? "1" : "";
+  $("hunt-status").textContent = h.enabled
+    ? `On. Last check: ${h.last_check ? new Date(h.last_check * 1000).toLocaleTimeString() : "soon"}. New tokens checked: ${h.checked}.` + (h.error ? ` Last error: ${h.error}` : "")
+    : "Off.";
+  $("hunt-recent").replaceChildren(...(h.recent.length ? h.recent.map(r => el("div", {text: `${r.time}  ${r.name}: ${r.result}`}))
+                                                        : [el("div", {text: "Nothing checked yet."})]));
+  $("alert-status").textContent = s.alerts_enabled ? "Telegram alerts are on." : "Telegram alerts are off (not configured).";
+  $("alert-list").replaceChildren(...(s.alerts.length ? s.alerts.map(a => el("div", {text: a})) : [el("div", {text: "No alerts yet."})]));
+  renderWatches(s.watches);
+  renderTable("gaps", "gaps-empty", s.dislocations, r => [r.opened_utc.replace("T", " ").slice(0, 19), r.watch,
+    `${r.buy_pool} → ${r.sell_pool}`, r.slots_open, r.seconds_open, fmt(r.peak_gap_pct, 3) + "%",
+    fmt(r.peak_net_gap_pct, 3) + "%",
+    depthCell(r)]);
+  renderTable("shocks", "shocks-empty", s.shocks, r => [r.time_utc.replace("T", " ").slice(0, 19), r.watch, r.pool,
+    el("span", {class: Number(r.move_pct) >= 0 ? "pos" : "neg", text: fmt(r.move_pct, 3) + "%"}), r.profitable_gap_visible]);
+  $("log").replaceChildren(...s.logs.map(l => el("div", {text: l})));
+}
+
+async function loadReport() {
+  try { $("report").textContent = await api("/api/report"); } catch (e) { $("report").textContent = e.message; }
+}
+
+$("discover").addEventListener("click", async () => {
+  const mint = $("mint").value.trim(), box = $("disc"), btn = $("discover");
+  if (!mint) return;
+  btn.disabled = true; box.replaceChildren(el("div", {class: "msg", text: "Looking up pools… (can take up to a minute)"}));
+  try {
+    const r = await api("/api/discover", {mint});
+    const parts = [el("pre", {text: r.notes.join("\n") || "No notes."})];
+    if (r.watches.length) {
+      parts.push(el("div", {class: "msg", text: r.watches.map(w => `${w.label}: ${w.pools.length} pools (${w.pools.map(p => p.name).join(", ")})`).join(" · ")}));
+      const add = el("button", {class: "primary", text: "Start watching", onclick: async () => {
+        add.disabled = true;
+        try { await api("/api/watches/add", {mint}); box.replaceChildren(el("div", {class: "msg", text: "Added. Watcher restarted."})); $("mint").value = ""; watchSig = ""; refresh(); }
+        catch (e) { box.append(el("div", {class: "msg err", text: e.message})); add.disabled = false; }
+      }});
+      parts.push(el("div", {class: "row mt"}, add));
+    } else parts.push(el("div", {class: "msg err", text: "No watch possible: this token needs 2+ Raydium AMM v4 / CPMM / PumpSwap pools against the same quote (SOL or USDC)."}));
+    box.replaceChildren(...parts);
+  } catch (e) { box.replaceChildren(el("div", {class: "msg err", text: e.message})); }
+  btn.disabled = false;
+});
+$("refresh-report").addEventListener("click", loadReport);
+$("hunt-toggle").addEventListener("click", async e => {
+  try { await api("/api/hunter", {enabled: !e.target.dataset.on}); refresh(); } catch (err) { $("hunt-status").textContent = err.message; }
+});
+$("test-alert").addEventListener("click", async () => {
+  try { const r = await api("/api/test-alert", {}); $("alert-status").textContent = r.enabled ? "Test alert sent. Check Telegram." : "Alerts are not configured yet."; }
+  catch (err) { $("alert-status").textContent = err.message; }
+});
+$("logout").addEventListener("click", async () => { try { await api("/api/logout", {}); } finally { location.href = "/login"; } });
+
+refresh(); loadReport();
+setInterval(refresh, 5000);
+setInterval(loadReport, 60000);
+</script>
+</body>
+</html>
