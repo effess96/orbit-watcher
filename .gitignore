@@ -1,0 +1,8 @@
+__pycache__/
+storage/
+data/
+data_replay/
+config.json
+*.zip
+.env
+.env.*

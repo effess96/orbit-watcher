@@ -288,6 +288,12 @@ class FakeSolanaWs:
                     self.pongs += 1
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
 
 
 SCRIPT = [  # a shock on A, then B catches up two slots later
@@ -336,7 +342,7 @@ class LiveStreamEndToEnd(TempDirCase):
         self.assertEqual(self.rows("dislocations.csv", out)[0]["slots_open"],
                          self.rows("dislocations.csv")[0]["slots_open"])
         text = W.report(self.dir)
-        self.assertIn("Profitable gaps seen and closed: 1", text)
+        self.assertIn("Candidate gaps seen and closed (CSV history): 1", text)
         self.assertIn("closed within 2 slots (~0.8 s): 100%", text)
 
 
@@ -503,8 +509,8 @@ class MixedEngine(TempDirCase):
         e.on_vault(VA_T, 10 ** 12, 100, 1000.0)
         e.on_vault(VA_Q, 10 ** 12, 100, 1000.0)
         for slot, raw in ((100, 1.0), (101, 1.03), (103, 1.0)):
-            e.on_account(WHIRL, b64acct(whirl_bytes(TOKEN, W.WSOL, raw)), slot, 1000.0 + slot / 10)
-            e.evaluate(1000.0 + slot / 10)
+            e.on_account(WHIRL, b64acct(whirl_bytes(TOKEN, W.WSOL, raw)), slot, 1000.0 + (slot - 100) / 10)
+            e.evaluate(1000.0 + (slot - 100) / 10)
         e.rec.raw_fh.flush()
         again = W.replay(mixed_config(), self.dir / "raw_updates.jsonl", self.dir / "replay")
         self.assertEqual(again.stats["dislocations"], e.stats["dislocations"])
@@ -608,16 +614,18 @@ class DepthAndSignals(TempDirCase):
         e.rec.dislocations.fh.flush()
         return self.rows("dislocations.csv")[-1]
 
-    def test_deep_gap_is_tradable_and_alerts(self):
+    def test_deep_concentrated_gap_still_requires_ticks(self):
         row = self.feed_gap(self.engine(), 10 ** 16)
-        self.assertEqual(row["tradable"], "yes")
-        self.assertGreater(float(row["depth_net_sol_1"]), 0.01)
+        self.assertEqual(row["tradable"], "unknown")
+        self.assertEqual(row["depth_reason"], "tick_or_bin_depth_unavailable")
+        self.assertEqual(row["execution_verified"], "no")
+        self.assertEqual(row["depth_net_sol_1"], "")
         self.assertEqual([k for k, _ in self.events], ["big_shock", "gap_closed"])   # +3% is also a big shock
 
-    def test_thin_gap_is_not_tradable(self):
+    def test_thin_concentrated_gap_has_no_unsupported_depth_estimate(self):
         row = self.feed_gap(self.engine(), 10 ** 9)                             # almost no liquidity at the price
-        self.assertEqual(row["tradable"], "no")
-        self.assertLess(float(row["depth_net_sol_0_25"]), 0)
+        self.assertEqual(row["tradable"], "unknown")
+        self.assertEqual(row["depth_net_sol_0_25"], "")
 
     def test_dlmm_gap_depth_unknown(self):
         cfg = mixed_config([{"name": "Met", "kind": "dlmm", "address": DLMM_POOL, "quote_mint": W.WSOL,
@@ -676,7 +684,7 @@ class DepthAndSignals(TempDirCase):
         e.rec.write_json("latency.json", e.latency_stats())
         e.rec.raw_fh.flush()
         text = W.report(self.dir)
-        self.assertIn("tradable after depth check", text)
+        self.assertIn("unverified", text)
         self.assertIn("behind the chain tip", text)
 
 

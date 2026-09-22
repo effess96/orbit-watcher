@@ -70,9 +70,17 @@ class Dashboard(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
-        cls.loop.call_soon_threadsafe(cls.task.cancel)
+        cls.httpd.server_close()
+        async def shutdown():
+            cls.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cls.task
+            cls.fake_ws.server.close()
+            await cls.fake_ws.server.wait_closed()
+        asyncio.run_coroutine_threadsafe(shutdown(), cls.loop).result(timeout=5)
         cls.loop.call_soon_threadsafe(cls.loop.stop)
         cls.thread.join(3)
+        cls.loop.close()
         cls.tmp.cleanup()
 
     # -- helpers --------------------------------------------------------------
@@ -120,6 +128,7 @@ class Dashboard(unittest.TestCase):
         self.assertEqual((st, h["Location"]), (303, "/login"))
         self.assertEqual(self.req("GET", "/api/state")[0], 401)
         self.assertEqual(self.req("GET", "/download/dislocations.csv")[0], 401)
+        self.assertEqual(self.req("GET", "/download/config.json")[0], 401)
         self.assertEqual(self.req("GET", "/healthz")[:1], (200,))
         st, h, b = self.req("GET", "/login")
         self.assertEqual(st, 200)
@@ -148,10 +157,22 @@ class Dashboard(unittest.TestCase):
         st, h, b = self.req("GET", "/", cookie=cookie)
         self.assertEqual(st, 200)
         self.assertNotIn(b"{{NONCE}}", b)
+        self.assertIn(b'/download/config.json', b)
+        self.assertIn(b'Model-positive estimates', b)
         nonce = h["Content-Security-Policy"].split("nonce-")[1].split("'")[0]
         self.assertIn(f'nonce="{nonce}"'.encode(), b)
         self.assertEqual(h["X-Frame-Options"], "DENY")
         self.assertIn("idle", self.state(cookie)["state"])
+
+    def test_4b_settings_export_is_authenticated_and_redacted(self):
+        cookie = self.login()
+        st, headers, body = self.req('GET', '/download/config.json', cookie=cookie)
+        self.assertEqual(st, 200)
+        self.assertIn('attachment', headers['Content-Disposition'])
+        cfg = json.loads(body)
+        self.assertIn('watches', cfg)
+        self.assertNotIn('rpc_http', cfg)
+        self.assertNotIn(PASSWORD, body.decode())
 
     def test_5_post_needs_same_origin_header(self):
         cookie = self.login()
@@ -183,7 +204,7 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(self.req("GET", "/download/..%2Fconfig.json", cookie=cookie)[0], 404)
         self.assertEqual(self.req("GET", "/download/.session_secret", cookie=cookie)[0], 404)
         st, _, b = self.req("GET", "/api/report", cookie=cookie)
-        self.assertIn(b"Profitable gaps seen and closed: 1", b)
+        self.assertIn(b"Candidate gaps seen and closed (CSV history): 1", b)
 
     def test_7_update_and_remove(self):
         cookie = self.login()

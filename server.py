@@ -42,7 +42,7 @@ ROOT = Path(__file__).resolve().parent
 SESSION_HOURS = 12
 RAW_ROTATE_BYTES = 200 * 1024 * 1024
 DOWNLOADS = {"dislocations.csv": "text/csv", "shocks.csv": "text/csv",
-             "raw_updates.jsonl": "application/x-ndjson"}
+             "raw_updates.jsonl": "application/x-ndjson", "raw_updates.1.jsonl": "application/x-ndjson"}
 GECKO_NEW_POOLS = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"
 HUNTER_DEFAULTS = {"enabled": False, "min_liquidity_usd": 10_000, "max_temp": 3, "minutes": 30, "every_s": 300}
 
@@ -195,19 +195,27 @@ class App:
         self.loop = asyncio.get_running_loop()
         self.recorder = W.Recorder(self.out)
         await self.restart()
-        asyncio.get_running_loop().create_task(self._sample_loop())
-        while True:
-            await asyncio.sleep(30)
-            self.maintain()
-            h = self.hunter_cfg()
-            if h["enabled"] and time.time() - self.last_hunt >= h["every_s"]:
-                self.last_hunt = time.time()
-                try:
-                    await asyncio.to_thread(self.hunt_once)
-                except Exception as e:
-                    self.hunter["error"] = f"{type(e).__name__}: {e}"
-            elif any(w.get("auto_until") and w["auto_until"] < time.time() for w in self.config().get("watches", [])):
-                await asyncio.to_thread(self.expire_auto)
+        sampler = asyncio.create_task(self._sample_loop())
+        try:
+            while True:
+                await asyncio.sleep(30)
+                self.maintain()
+                h = self.hunter_cfg()
+                if h["enabled"] and time.time() - self.last_hunt >= h["every_s"]:
+                    self.last_hunt = time.time()
+                    try:
+                        await asyncio.to_thread(self.hunt_once)
+                    except Exception as e:
+                        self.hunter["error"] = f"{type(e).__name__}: {e}"
+                elif any(w.get("auto_until") and w["auto_until"] < time.time() for w in self.config().get("watches", [])):
+                    await asyncio.to_thread(self.expire_auto)
+        finally:
+            tasks = [sampler] + ([self.task] if self.task else [])
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.recorder.close()
+            self.state = 'stopped'
 
     async def restart(self) -> None:
         if self.task:
@@ -288,12 +296,12 @@ class App:
         """Called by the engine: a gap closed or a big shock happened."""
         if kind == "gap_closed" and data.get("tradable") == "yes":
             best = max(float(data[k]) for k in ("depth_net_sol_0_25", "depth_net_sol_1", "depth_net_sol_5"))
-            text = (f"Orbit: tradable gap on {data['watch']}\n{data['buy_pool']} -> {data['sell_pool']}\n"
-                    f"net after fees {data['peak_net_gap_pct']}%, best depth-checked net {best:.5f} SOL, "
+            text = (f"Orbit: model-positive candidate on {data['watch']}\n{data['buy_pool']} -> {data['sell_pool']}\n"
+                    f"net after fees {data['peak_net_gap_pct']}%, peak modeled net {best:.5f} SOL, "
                     f"open {data['slots_open']} slots ({data['seconds_open']} s). Read-only: no trade was made.")
         elif kind == "big_shock":
             text = (f"Orbit: big shock on {data['watch']}: {data['pool']} moved {data['move_pct']}% in one update "
-                    f"(slot {data['slot']}). Profitable gap visible: {'yes' if data['gap_visible'] else 'no'}.")
+                    f"(slot {data['slot']}). Candidate gap visible: {'yes' if data['gap_visible'] else 'no'}.")
         else:
             return
         self.alerts.appendleft(f"{time.strftime('%H:%M:%S')}  {text.splitlines()[0]} " +
@@ -429,6 +437,11 @@ class App:
             "state": self.state, "uptime_s": round(time.time() - self.started),
             "updates": e.updates if e else 0, "slot": e.last_slot if e else 0,
             "stats": dict(e.stats) if e else {}, "watches": watches,
+            "quality": {'blocked_pairs': [{'watch': k[0], 'buy': k[1], 'sell': k[2], 'reason': v}
+                                           for k, v in list(e.blocked_pairs.items())] if e else [],
+                        'max_state_age_s': e.max_state_age if e else cfg.get('max_state_age_s', 10),
+                        'max_state_slot_lag': e.max_state_slot_lag if e else cfg.get('max_state_slot_lag', 8),
+                        'execution_verified': False},
             "rpc": "private" if os.environ.get("SOLANA_RPC_HTTP") else "public",
             "latency": e.latency_stats() if e else None,
             "history": list(self.history)[-720::2], "open_gaps": self.open_gaps(),
@@ -598,11 +611,18 @@ def make_handler(app: App):
                 if app.recorder and app.recorder.raw_fh and not app.recorder.raw_fh.closed:
                     app.recorder.raw_fh.flush()
                 return self.send(200, W.report(app.out).encode(), "text/plain; charset=utf-8")
+            if path == '/download/config.json':
+                payload = json.dumps(W.research_config(app.config()), indent=2).encode()
+                return self.send(200, payload, 'application/json',
+                                 {'Content-Disposition': 'attachment; filename="config.json"'})
             if path.startswith("/download/"):
                 name = path.rsplit("/", 1)[-1]
                 f = app.out / name
                 if name not in DOWNLOADS or not f.exists():
                     return self.json({"error": "not found"}, 404)
+                if name == 'raw_updates.jsonl' and app.recorder and app.recorder.raw_fh:
+                    if not app.recorder.raw_fh.closed:
+                        app.recorder.raw_fh.flush()
                 return self.send(200, f.read_bytes(), DOWNLOADS[name],
                                  {"Content-Disposition": f'attachment; filename="{name}"'})
             self.json({"error": "not found"}, 404)
