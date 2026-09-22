@@ -60,6 +60,25 @@ a{color:var(--blue)}
 .meter .bar{height:10px;border-radius:5px;background:var(--track);margin-top:6px;overflow:hidden}
 .meter .fill{height:100%;border-radius:5px;background:var(--s1)}
 .chart{position:relative}.chart svg{display:block;width:100%}
+.controls{gap:14px;flex-wrap:wrap;margin-bottom:8px;font-size:13px;color:var(--muted)}
+.controls select{margin-left:6px;background:var(--bg,#0b1016);color:var(--text);border:1px solid var(--axis);border-radius:6px;padding:4px 8px;font:inherit}.controls .chk{display:flex;align-items:center;gap:6px}
+table.sortable th[data-k]{cursor:pointer;user-select:none;white-space:nowrap}
+table.sortable th[data-k]:hover{color:var(--text)}
+table.sortable th.sorted::after{content:" ▾"}table.sortable th.sorted.asc::after{content:" ▴"}
+tr.grp td{background:var(--track);font-weight:600;color:var(--text)}
+.watch .whead{cursor:pointer;user-select:none}
+.watch .chev{display:inline-block;width:1em;color:var(--muted);transition:transform .15s}
+.watch.open .chev{transform:rotate(90deg)}
+.watch .wbody{display:none;margin-top:8px}.watch.open .wbody{display:block}
+.watch .sum{font-size:12px;color:var(--muted)}.watch .sum b{color:var(--text)}
+.watch{padding-top:10px;padding-bottom:10px}
+.bars{display:flex;flex-direction:column;gap:7px;margin-top:8px;font-size:12px}
+.brow{display:grid;grid-template-columns:minmax(90px,38%) 1fr auto;gap:8px;align-items:center}
+.brow .lbl{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brow .trk{position:relative;height:10px;background:var(--track);border-radius:5px}
+.brow .trk i{position:absolute;top:0;bottom:0;border-radius:5px}
+.brow .trk .zero{position:absolute;top:-3px;bottom:-3px;width:1px;background:var(--axis)}
+.brow b{font-variant-numeric:tabular-nums;min-width:62px;text-align:right}
 .legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--muted);margin-bottom:6px}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
 .legend b{color:var(--text);font-weight:500;margin-left:4px}
@@ -118,8 +137,50 @@ section,.watch{min-width:0}
   </div>
 
   <section>
+    <h2>Earnings overview</h2>
+    <div class="gauges">
+      <div class="gauge"><div class="k">Best position right now (net vs holding)</div><div id="g-lp"></div></div>
+      <div class="gauge"><div class="k">Positions</div>
+        <div class="meter" id="m-ahead"></div><div class="meter" id="m-range"></div><div class="meter" id="m-hours"></div></div>
+      <div class="gauge"><div class="k">Best result per token (net vs holding)</div><div id="b-token" class="bars"></div></div>
+    </div>
+    <p class="note">All paper positions, no real money. The tracking meter fills toward 72 hours, the minimum before results mean much.</p>
+  </section>
+
+  <div class="two">
+    <section>
+      <h2>Net vs holding over time: top 6 positions (%)</h2>
+      <div class="chart" id="c-lp"></div>
+      <p class="note">Above zero: providing liquidity beat holding. Watch for lines that stay up after a big price move, not ones that spike.</p>
+    </section>
+    <section>
+      <h2>Fees earned vs price-move loss so far (±5% positions)</h2>
+      <div id="b-feeloss" class="bars"></div>
+      <p class="note">Green: fees collected so far. Red: loss from price moves so far. Same units, so you can compare them directly. A pool is only interesting if green keeps beating red over days.</p>
+    </section>
+  </div>
+
+  <section>
+    <h2>Arbitrage by token</h2>
+    <div class="scroll"><table><thead><tr><th>Token</th><th>Gaps seen</th><th>Tradable</th><th>Closed within 1 slot</th><th>Median time open</th><th>Best 2.5 SOL round trip</th></tr></thead>
+      <tbody id="arb"></tbody></table></div>
+    <div id="arb-empty" class="empty">No gaps yet.</div>
+    <p class="note">"Closed within 1 slot" means a faster bot took it before a home setup could act.</p>
+  </section>
+
+  <section>
     <h2>Pool earnings (paper liquidity positions)</h2>
-    <div class="scroll"><table><thead><tr><th>Pool</th><th>Range</th><th>Tracked</th><th>In range</th><th>Fees earned</th><th>Fees per day</th><th>Price-move loss</th><th>Net vs holding</th></tr></thead>
+    <div class="row controls">
+      <label>Token <select id="lp-token"><option value="">All tokens</option></select></label>
+      <label>Range <select id="lp-range"><option value="">Both</option><option value="5">±5%</option><option value="20">±20%</option></select></label>
+      <label class="chk"><input type="checkbox" id="lp-hide" checked> Hide rows with no activity</label>
+      <label class="chk"><input type="checkbox" id="lp-group"> Group by token</label>
+      <span class="spacer"></span><span class="note" id="lp-count"></span>
+    </div>
+    <div class="scroll"><table class="sortable"><thead><tr id="lp-head">
+      <th data-k="watch">Token</th><th data-k="pool">Pool</th><th data-k="range_pct">Range</th><th data-k="hours">Tracked</th>
+      <th data-k="in_range_pct">In range</th><th data-k="fees_pct">Fees earned</th><th data-k="fees_per_day_pct">Fees per day</th>
+      <th data-k="price_move_pct">Price-move loss</th><th data-k="net_vs_hold_pct">Net vs holding</th></tr></thead>
       <tbody id="lp"></tbody></table></div>
     <div id="lp-empty" class="empty">Waiting for Orca or Raydium CLMM pool updates.</div>
     <p class="note">A pretend 100 SOL/USDC position in each Orca and Raydium CLMM pool, over a price range of ±5% or ±20% set when tracking started. Fees come from each pool's own on-chain fee counter.
@@ -134,7 +195,7 @@ section,.watch{min-width:0}
   </section>
 
   <section>
-    <h2>Watches</h2>
+    <h2>Watches <button id="w-expand">Expand all</button> <button id="w-collapse">Collapse all</button></h2>
     <div id="watches"></div>
     <p class="note">Costs, minimum profit and fees are your assumptions. Saving restarts the watcher; gaps open at that moment are dropped, not mistimed.</p>
   </section>
@@ -219,6 +280,16 @@ let watchSig = "";
 const KIND = {cp: "constant product", whirlpool: "Orca Whirlpool", clmm: "Raydium CLMM", dlmm: "Meteora DLMM (fee + 1 bin)"};
 const pct = f => fmt(f * 100, 4) + "%";
 const feeText = p => pct(p.fee) + " live" + (p.adaptive_fee ? ` (incl. ${pct(p.adaptive_fee)} volatility)` : "");
+let openWatches = new Set();
+try { openWatches = new Set(JSON.parse(localStorage.getItem("orbit-open") || "[]")); } catch (e) {}
+const saveOpen = () => { try { localStorage.setItem("orbit-open", JSON.stringify([...openWatches])); } catch (e) {} };
+let lpByWatch = {};
+function leaderText(label) {
+  const r = lpByWatch[label];
+  return r ? `${r.pool.replace(/^(Orca Whirlpool|Raydium CLMM) /, "")} ±${r.range_pct}% ${r.net_vs_hold_pct >= 0 ? "+" : ""}${fmt(r.net_vs_hold_pct, 3)}%` : "not measured";
+}
+function netText(w) { return w.net_gap_pct === null || w.net_gap_pct === undefined ? "–" : fmt(w.net_gap_pct, 3) + "%"; }
+
 function renderWatches(ws) {
   const sig = JSON.stringify(ws.map(w => [w.label, w.cost_sol, w.min_profit_sol, w.min_net_gap_pct, w.shock_pct,
     w.pools.map(p => [p.name, p.fee_editable ? p.fee : null, p.suspect])]));
@@ -228,6 +299,8 @@ function renderWatches(ws) {
       const card = box.children[i]; if (!card) return;
       card.querySelector(".gapv").textContent = w.gap_pct === null ? "waiting for data" : fmt(w.gap_pct, 4) + "%";
       card.querySelector(".openv").textContent = w.open;
+      card.querySelector(".netv").textContent = netText(w);
+      card.querySelector(".leadv").textContent = leaderText(w.label);
       w.pools.forEach((p, j) => {
         const c = card.querySelectorAll(".price")[j]; if (c) c.textContent = p.price === null ? "–" : `${fmt(p.price, 10)} ${p.quote}`;
         const f = card.querySelectorAll(".livefee")[j]; if (f && !p.fee_editable) f.textContent = feeText(p);
@@ -273,12 +346,24 @@ function renderWatches(ws) {
       try { await api("/api/watches/remove", {label: w.label}); watchSig = ""; refresh(); }
       catch (e) { msg.className = "msg err"; msg.textContent = e.message; }
     }});
-    box.append(el("div", {class: "watch"},
-      el("div", {class: "row"}, el("h3", {text: w.label}),
+    remove.addEventListener("click", ev => ev.stopPropagation());
+    const card = el("div", {class: "watch" + (openWatches.has(w.label) ? " open" : ""), "data-label": w.label});
+    const head = el("div", {class: "row whead", role: "button", tabindex: "0", "aria-expanded": String(openWatches.has(w.label))},
+        el("span", {class: "chev", text: "▸", "aria-hidden": "true"}), el("h3", {text: w.label}),
         w.auto_until ? el("span", {class: "pill warn", text: `hunter · ends in ${Math.max(0, Math.round((w.auto_until * 1000 - Date.now()) / 60000))} min`}) : "",
-        el("span", {class: "gap"}, "gap now ", el("b", {class: "gapv", text: w.gap_pct === null ? "waiting for data" : fmt(w.gap_pct, 4) + "%"})),
-        el("span", {class: "gap"}, "open ", el("b", {class: "openv", text: w.open})),
-        el("span", {class: "spacer"}), remove),
+        el("span", {class: "sum"}, `${w.pools.length} pools · raw gap `, el("b", {class: "gapv", text: w.gap_pct === null ? "waiting for data" : fmt(w.gap_pct, 4) + "%"}),
+          " · after fees ", el("b", {class: "netv", text: netText(w)}),
+          " · open ", el("b", {class: "openv", text: w.open}),
+          " · earnings leader ", el("b", {class: "leadv", text: leaderText(w.label)})),
+        el("span", {class: "spacer"}), remove);
+    const toggle = () => {
+      const on = card.classList.toggle("open");
+      head.setAttribute("aria-expanded", String(on));
+      on ? openWatches.add(w.label) : openWatches.delete(w.label); saveOpen();
+    };
+    head.addEventListener("click", toggle);
+    head.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); } });
+    card.append(head, el("div", {class: "wbody"},
       w.ref ? el("p", {class: "note", text: `USDC prices are converted to SOL with ${w.ref}.`}) : "",
       el("div", {class: "scroll"}, el("table", {}, el("thead", {}, el("tr", {},
         el("th", {text: "Pool"}), el("th", {text: "Type"}), el("th", {text: "Price"}), el("th", {text: "Fee (0.0025 = 0.25%)"}),
@@ -290,7 +375,16 @@ function renderWatches(ws) {
         el("label", {}, "Min net gap after fees, other pairs (%)", num("min_net_gap_pct", "0.05")),
         el("label", {}, "Shock threshold (%)", num("shock_pct", "0.1"))),
       el("div", {class: "row"}, save), msg));
+    box.append(card);
   }
+}
+function setAllWatches(on) {
+  document.querySelectorAll("#watches .watch").forEach(c => {
+    c.classList.toggle("open", on);
+    c.querySelector(".whead").setAttribute("aria-expanded", String(on));
+    on ? openWatches.add(c.dataset.label) : openWatches.delete(c.dataset.label);
+  });
+  saveOpen();
 }
 
 function depthCell(r) {
@@ -427,6 +521,91 @@ function renderLive(s) {
       : el("span", {class: g.depth_best >= g.min_profit ? "pos" : "neg", text: `${fmt(g.depth_best, 5)} SOL ${g.depth_best >= g.min_profit ? "tradable" : "not tradable"}`})]);
 }
 
+function bars(host, rows, emptyText) {
+  // rows: [{label, value, color, text}] ; draws signed bars around a shared zero
+  if (!rows.length) { host.replaceChildren(el("div", {class: "empty", text: emptyText})); return; }
+  const lo = Math.min(0, ...rows.map(r => r.value)), hi = Math.max(0, ...rows.map(r => r.value));
+  const span = Math.max(1e-9, hi - lo), pos = v => (v - lo) / span * 100;
+  host.replaceChildren(...rows.map(r => {
+    const bar = el("i"); const a = pos(Math.min(0, r.value)), b = pos(Math.max(0, r.value));
+    bar.style.left = a + "%"; bar.style.width = Math.max(0.8, b - a) + "%"; bar.style.background = r.color;
+    const zero = el("span", {class: "zero"}); zero.style.left = pos(0) + "%";
+    const val = el("b", {text: r.text}); val.style.color = r.color;
+    return el("div", {class: "brow", title: `${r.label}: ${r.text}`}, el("span", {class: "lbl", text: r.label}), el("div", {class: "trk"}, zero, bar), val);
+  }));
+}
+
+function renderInsights(s) {
+  const lp = s.lp || [], good = cssv("--good"), bad = cssv("--critical"), pct = v => (v >= 0 ? "+" : "") + fmt(v, 3) + "%";
+  const live = lp.filter(r => r.hours > 0);
+  if (live.length) {
+    const top = live.reduce((a, b) => b.net_vs_hold_pct > a.net_vs_hold_pct ? b : a);
+    const v = top.net_vs_hold_pct;
+    gauge($("g-lp"), Math.max(0, Math.min(1, v / 1)), pct(v), `${top.pool} ±${top.range_pct}% · ${top.watch}`, v >= 0 ? good : bad);
+  } else gauge($("g-lp"), 0, "–", "waiting for data", cssv("--muted"));
+  const ahead = live.filter(r => r.net_vs_hold_pct > 0).length, inr = live.filter(r => r.in_range_now).length;
+  const hrs = live.length ? Math.max(...live.map(r => r.hours)) : 0;
+  meter($("m-ahead"), "Ahead of holding", ahead, live.length, ahead >= live.length / 2 ? good : cssv("--warning"), `${ahead} of ${live.length} positions`);
+  meter($("m-range"), "In range right now", inr, live.length, inr === live.length ? good : cssv("--warning"), `${inr} of ${live.length} positions earning fees now`);
+  meter($("m-hours"), "Tracked so far", Math.min(hrs, 72), 72, hrs >= 72 ? good : cssv("--s1"), `${fmt(hrs, 1)} of 72 hours`);
+  const best = {};
+  for (const r of live) if (!best[r.watch] || r.net_vs_hold_pct > best[r.watch].net_vs_hold_pct) best[r.watch] = r;
+  bars($("b-token"), Object.values(best).sort((a, b) => b.net_vs_hold_pct - a.net_vs_hold_pct)
+    .map(r => ({label: r.watch, value: r.net_vs_hold_pct, color: r.net_vs_hold_pct >= 0 ? good : bad, text: pct(r.net_vs_hold_pct)})), "Waiting for data.");
+  const five = live.filter(r => r.range_pct === 5).sort((a, b) => b.fees_pct - a.fees_pct).slice(0, 8);
+  const fl = [];
+  for (const r of five) {
+    fl.push({label: `${r.watch} · ${r.pool}`, value: r.fees_pct, color: good, text: pct(r.fees_pct)});
+    fl.push({label: "  price-move loss", value: r.price_move_pct, color: bad, text: pct(r.price_move_pct)});
+  }
+  bars($("b-feeloss"), fl, "Waiting for data.");
+  const h = s.history || [], latest = h.length ? (h[h.length - 1].lp || {}) : {};
+  const names = Object.keys(latest).sort((a, b) => latest[b] - latest[a]).slice(0, 6);
+  lineChart($("c-lp"), names.map((n, i) => ({name: n, color: SERIES[i % 8],
+    pts: h.filter(p => p.lp && p.lp[n] !== undefined).map(p => [p.t, p.lp[n]])})), {unit: "%", ref: 0, label: "Net vs holding over time", tickDigits: 3});
+  renderTable("arb", "arb-empty", (s.rates && s.rates.by_watch) || [], r => [r.watch, r.gaps,
+    el("span", {class: r.tradable ? "pos" : "", text: String(r.tradable)}),
+    `${r.within_1_slot} of ${r.gaps}`, r.median_slots === null ? "–" : `${r.median_slots} slots`,
+    r.best_depth_sol === null ? "unknown (Meteora)" : el("span", {class: r.best_depth_sol > 0 ? "pos" : "neg", text: `${fmt(r.best_depth_sol, 4)} SOL`})]);
+}
+
+let lastLp = [], lpSort = {k: "net_vs_hold_pct", asc: false};
+function renderLp() {
+  const tokSel = $("lp-token"), tokens = [...new Set(lastLp.map(r => r.watch))].sort();
+  const cur = tokSel.value;
+  if (tokSel.options.length - 1 !== tokens.length || tokens.some((t, i) => tokSel.options[i + 1].value !== t)) {
+    tokSel.replaceChildren(el("option", {value: "", text: "All tokens"}), ...tokens.map(t => el("option", {value: t, text: t})));
+    tokSel.value = tokens.includes(cur) ? cur : "";
+  }
+  const tok = tokSel.value, rng = $("lp-range").value, hide = $("lp-hide").checked, group = $("lp-group").checked;
+  let rows = lastLp.filter(r => (!tok || r.watch === tok) && (!rng || String(r.range_pct) === rng)
+    && (!hide || (r.hours > 0 && (r.fees_pct !== 0 || r.price_move_pct !== 0))));
+  const {k, asc} = lpSort, dir = asc ? 1 : -1;
+  const cmp = (a, b) => (typeof a[k] === "string" ? a[k].localeCompare(b[k]) : (a[k] ?? -Infinity) - (b[k] ?? -Infinity)) * dir;
+  rows.sort(cmp);
+  document.querySelectorAll("#lp-head th").forEach(th => { th.classList.toggle("sorted", th.dataset.k === k); th.classList.toggle("asc", th.dataset.k === k && asc); });
+  $("lp-count").textContent = `${rows.length} of ${lastLp.length} positions`;
+  const pc = v => el("span", {class: v >= 0 ? "pos" : "neg", text: (v >= 0 ? "+" : "") + fmt(v, 3) + "%"});
+  const line = r => el("tr", {}, [r.watch || "", `${r.pool} (${r.quote})`, `±${r.range_pct}%`, `${fmt(r.hours, 1)} h`,
+    `${fmt(r.in_range_pct, 0)}%${r.in_range_now ? "" : " (out now)"}`, pc(r.fees_pct), pc(r.fees_per_day_pct),
+    pc(r.price_move_pct), pc(r.net_vs_hold_pct)].map(c => c instanceof Node ? el("td", {}, c) : el("td", {text: c})));
+  const out = [];
+  if (group) {
+    const by = {};
+    for (const r of rows) (by[r.watch] = by[r.watch] || []).push(r);
+    const best = g => Math.max(...g.map(r => r.net_vs_hold_pct));
+    for (const [t, g] of Object.entries(by).sort((a, b) => best(b[1]) - best(a[1]))) {
+      const b = best(g);
+      out.push(el("tr", {class: "grp"}, el("td", {colspan: "9"}, `${t} · ${g.length} position${g.length === 1 ? "" : "s"} · best net vs holding `,
+        el("span", {class: b >= 0 ? "pos" : "neg", text: (b >= 0 ? "+" : "") + fmt(b, 3) + "%"}))));
+      g.forEach(r => out.push(line(r)));
+    }
+  } else rows.forEach(r => out.push(line(r)));
+  $("lp").replaceChildren(...out);
+  $("lp-empty").style.display = rows.length ? "none" : "block";
+  $("lp-empty").textContent = lastLp.length ? "No positions match these filters." : "Waiting for Orca or Raydium CLMM pool updates.";
+}
+
 async function refresh() {
   let s;
   try { s = await api("/api/state"); } catch (e) { $("state").textContent = "offline"; $("state").className = "pill warn"; return; }
@@ -450,12 +629,13 @@ async function refresh() {
                                                         : [el("div", {text: "Nothing checked yet."})]));
   $("alert-status").textContent = s.alerts_enabled ? "Telegram alerts are on." : "Telegram alerts are off (not configured).";
   $("alert-list").replaceChildren(...(s.alerts.length ? s.alerts.map(a => el("div", {text: a})) : [el("div", {text: "No alerts yet."})]));
+  lpByWatch = {};
+  for (const r of (s.lp || [])) if (r.hours > 0 && (!lpByWatch[r.watch] || r.net_vs_hold_pct > lpByWatch[r.watch].net_vs_hold_pct)) lpByWatch[r.watch] = r;
   renderWatches(s.watches);
   renderLive(s);
-  const pc = v => el("span", {class: v >= 0 ? "pos" : "neg", text: (v >= 0 ? "+" : "") + fmt(v, 3) + "%"});
-  renderTable("lp", "lp-empty", s.lp || [], r => [`${r.pool} (${r.quote})`, `±${r.range_pct}%`, `${fmt(r.hours, 1)} h`,
-    `${fmt(r.in_range_pct, 0)}%${r.in_range_now ? "" : " (out now)"}`, pc(r.fees_pct), pc(r.fees_per_day_pct),
-    pc(r.price_move_pct), pc(r.net_vs_hold_pct)]);
+  renderInsights(s);
+  lastLp = s.lp || [];
+  renderLp();
   renderTable("gaps", "gaps-empty", s.dislocations, r => [r.opened_utc.replace("T", " ").slice(0, 19), r.watch,
     `${r.buy_pool} → ${r.sell_pool}`, r.slots_open, r.seconds_open, fmt(r.peak_gap_pct, 3) + "%",
     fmt(r.peak_net_gap_pct, 3) + "%",
@@ -499,6 +679,13 @@ $("test-alert").addEventListener("click", async () => {
 });
 $("logout").addEventListener("click", async () => { try { await api("/api/logout", {}); } finally { location.href = "/login"; } });
 
+["lp-token", "lp-range", "lp-hide", "lp-group"].forEach(id => $(id).addEventListener("change", renderLp));
+document.querySelectorAll("#lp-head th[data-k]").forEach(th => th.addEventListener("click", () => {
+  lpSort = lpSort.k === th.dataset.k ? {k: th.dataset.k, asc: !lpSort.asc} : {k: th.dataset.k, asc: ["watch", "pool"].includes(th.dataset.k)};
+  renderLp();
+}));
+$("w-expand").addEventListener("click", () => setAllWatches(true));
+$("w-collapse").addEventListener("click", () => setAllWatches(false));
 refresh(); loadReport();
 setInterval(refresh, 3000);
 setInterval(loadReport, 60000);

@@ -257,7 +257,9 @@ class App:
                              "gaps": {w.label: round(g, 4) for w in e.watches
                                       if (g := e.max_gap_pct(w)) is not None},
                              "net": {w.label: round(g, 4) for w in e.watches
-                                     if (g := e.best_net_gap_pct(w)) is not None}})
+                                     if (g := e.best_net_gap_pct(w)) is not None},
+                             "lp": {f"{r['pool']} ±{r['range_pct']}%": r["net_vs_hold_pct"]
+                                    for r in e.lp.summary()}})
 
     def rates(self) -> dict:
         """Depth-check pass rate and speed of closing, from the full CSV (cached 30 s)."""
@@ -265,11 +267,34 @@ class App:
             return self._rates
         rows = W.read_csv(self.out / "dislocations.csv")
         checked = [r for r in rows if r.get("tradable") in ("yes", "no")]
-        self._rates = {"t": time.time(), "gaps": len(rows), "checked": len(checked),
+        by_watch = []
+        for label in sorted({r.get("watch", "").strip() for r in rows} - {""}):
+            mine = [r for r in rows if r.get("watch", "").strip() == label]
+            slots = sorted(int(r["slots_open"]) for r in mine if r.get("slots_open", "").isdigit())
+            depth = [float(r["depth_net_sol_2_5"]) for r in mine if r.get("depth_net_sol_2_5") not in (None, "")]
+            by_watch.append({"watch": label, "gaps": len(mine),
+                             "tradable": sum(r.get("tradable") == "yes" for r in mine),
+                             "median_slots": slots[len(slots) // 2] if slots else None,
+                             "within_1_slot": sum(x <= 1 for x in slots),
+                             "best_depth_sol": max(depth) if depth else None})
+        self._rates = {"t": time.time(), "gaps": len(rows), "checked": len(checked), "by_watch": by_watch,
                        "tradable": sum(r["tradable"] == "yes" for r in checked),
                        "within_1_slot": sum(1 for r in rows if r.get("slots_open", "").isdigit()
                                             and int(r["slots_open"]) <= 1)}
         return self._rates
+
+    def lp_rows(self) -> list[dict]:
+        """Pool-earnings rows, each tagged with the watch (token) it belongs to."""
+        e = self.engine
+        if not e:
+            return []
+        owner = {}
+        for w in e.watches:
+            for p in w.pools:
+                owner.setdefault(p.address, w.label)
+            if w.ref:
+                owner.setdefault(w.ref.address, "SOL/USDC")
+        return [{**r, "watch": owner.get(r["address"], "?")} for r in e.lp.summary()]
 
     def open_gaps(self) -> list[dict]:
         e, out = self.engine, []
@@ -438,7 +463,7 @@ class App:
             "stats": dict(e.stats) if e else {}, "watches": watches,
             "rpc": "private" if os.environ.get("SOLANA_RPC_HTTP") else "public",
             "latency": e.latency_stats() if e else None,
-            "lp": e.lp.summary() if e else [],
+            "lp": self.lp_rows(),
             "history": list(self.history)[-720::2], "open_gaps": self.open_gaps(),
             "rates": {k: v for k, v in self.rates().items() if k != "t"},
             "min_net_gap_pct": min((w.min_net_gap * 100 for w in e.watches), default=0.2) if e else 0.2,
