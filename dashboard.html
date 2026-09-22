@@ -86,22 +86,23 @@ section,.watch{min-width:0}
     <div class="tile"><div class="k">Pool updates</div><div class="v" id="t-updates">–</div></div>
     <div class="tile"><div class="k">Latest slot</div><div class="v" id="t-slot">–</div></div>
     <div class="tile"><div class="k">Shocks</div><div class="v" id="t-shocks">–</div></div>
-    <div class="tile"><div class="k">Profitable gaps closed</div><div class="v" id="t-gaps">–</div></div>
+    <div class="tile"><div class="k">Candidate gaps closed</div><div class="v" id="t-gaps">–</div></div>
     <div class="tile"><div class="k">Open right now</div><div class="v" id="t-open">–</div></div>
-    <div class="tile"><div class="k">Tradable after depth check</div><div class="v" id="t-trad">–</div></div>
+    <div class="tile"><div class="k">Model-positive estimates</div><div class="v" id="t-trad">–</div></div>
     <div class="tile"><div class="k">Behind chain tip (median)</div><div class="v" id="t-lag">–</div></div>
   </div>
 
   <section>
     <h2>Live overview <span class="note" id="live-age"></span></h2>
+    <p class="note" id="quality-status"></p>
     <div class="gauges">
       <div class="gauge"><div class="k">Behind chain tip (median, slots)</div><div id="g-lag"></div></div>
       <div class="gauge"><div class="k">Best gap after fees right now</div><div id="g-gap"></div></div>
       <div class="gauge"><div class="k">Rates</div>
         <div class="meter" id="m-depth"></div><div class="meter" id="m-fast"></div><div class="meter" id="m-up"></div></div>
     </div>
-    <p class="note">Rates are measurements, not profits: "tradable" means a simulated round trip would have cleared your costs.
-      "Closed within 1 slot" is how often someone else was faster than a home setup could possibly be.</p>
+    <p class="note">Estimates are research signals, not executable quotes or earned profits. Concentrated-pool and cross-currency depth remain unverified.
+      Closure timing measures an observed gap; it does not identify who traded or why it closed. Historical results retain their original model classifications.</p>
   </section>
 
   <div class="two">
@@ -119,9 +120,9 @@ section,.watch{min-width:0}
 
   <section>
     <h2>Open gaps right now</h2>
-    <div class="scroll"><table><thead><tr><th>Watch</th><th>Buy → sell</th><th>Open for</th><th>After fees</th><th>Depth check</th></tr></thead>
+    <div class="scroll"><table><thead><tr><th>Watch</th><th>Buy → sell</th><th>Open for</th><th>Peak after fees</th><th>Depth check</th></tr></thead>
       <tbody id="opengaps"></tbody></table></div>
-    <div id="opengaps-empty" class="empty">No gaps open. Prices across pools agree within fees.</div>
+    <div id="opengaps-empty" class="empty">No eligible gaps open. Check freshness status and pool coverage above.</div>
   </section>
 
   <section>
@@ -142,7 +143,7 @@ section,.watch{min-width:0}
       <h2>Alerts <button id="test-alert">Send test</button></h2>
       <div id="alert-status" class="note"></div>
       <div id="alert-list" class="log"></div>
-      <p class="note">Telegram alerts for gaps that pass the depth check and for single-update moves of 3%+.
+      <p class="note">Telegram alerts for model-positive candidates and for single-update moves of 3%+.
         Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway to turn them on.</p>
     </section>
   </div>
@@ -158,8 +159,8 @@ section,.watch{min-width:0}
 
   <div class="two">
     <section>
-      <h2>Recent profitable gaps</h2>
-      <div class="scroll"><table><thead><tr><th>Opened (UTC)</th><th>Watch</th><th>Buy → sell</th><th>Slots</th><th>Seconds</th><th>Peak gap</th><th>After fees</th><th>Depth check</th></tr></thead><tbody id="gaps"></tbody></table></div>
+      <h2>Recent candidate gaps</h2>
+      <div class="scroll"><table><thead><tr><th>Opened (UTC)</th><th>Watch</th><th>Buy → sell</th><th>Slots</th><th>Seconds</th><th>Peak gap</th><th>Peak after fees</th><th>Depth check</th></tr></thead><tbody id="gaps"></tbody></table></div>
       <div id="gaps-empty" class="empty">None yet.</div>
     </section>
     <section>
@@ -172,7 +173,7 @@ section,.watch{min-width:0}
   <section>
     <h2>Report <button id="refresh-report">Refresh</button></h2>
     <pre id="report">Loading…</pre>
-    <p class="note">Downloads: <a href="/download/dislocations.csv">dislocations.csv</a> · <a href="/download/shocks.csv">shocks.csv</a> · <a href="/download/raw_updates.jsonl">raw_updates.jsonl</a></p>
+    <p class="note">Downloads: <a href="/download/config.json">Replay settings (no credentials)</a> · <a href="/download/dislocations.csv">dislocations.csv</a> · <a href="/download/shocks.csv">shocks.csv</a> · <a href="/download/raw_updates.jsonl">raw_updates.jsonl</a></p>
   </section>
 
   <section>
@@ -286,10 +287,10 @@ function renderWatches(ws) {
 function depthCell(r) {
   if (r.tradable === "yes") {
     const best = Math.max(...["depth_net_sol_0_25", "depth_net_sol_1", "depth_net_sol_5"].map(k => Number(r[k])));
-    return el("span", {class: "pos", text: `tradable, ${fmt(best, 5)} SOL`});
+    return el("span", {class: "pos", text: `model estimate: ${fmt(best, 5)} SOL`});
   }
-  if (r.tradable === "no") return el("span", {class: "neg", text: "not tradable"});
-  return "unknown";
+  if (r.tradable === "no") return el("span", {class: "neg", text: "model below threshold"});
+  return r.depth_reason ? r.depth_reason.replaceAll("_", " ") : "unverified (historical record)";
 }
 
 function renderTable(body, empty, rows, cells) {
@@ -396,8 +397,8 @@ function renderLive(s) {
     gauge($("g-gap"), Math.max(0, best) / (thr * 2), `${fmt(best, 3)}%`, `${st} · ${who ? who.label : ""} · threshold ${fmt(thr, 2)}%`, c);
   } else gauge($("g-gap"), 0, "–", "waiting for data", cssv("--muted"));
   const r = s.rates || {};
-  meter($("m-depth"), "Tradable after depth check", r.tradable || 0, r.checked || 0, cssv("--s1"), `${r.tradable || 0} of ${r.checked || 0} depth-checked gaps`);
-  meter($("m-fast"), "Closed within 1 slot", r.within_1_slot || 0, r.gaps || 0, cssv("--s1"), `${r.within_1_slot || 0} of ${r.gaps || 0} gaps (competition speed)`);
+  meter($("m-depth"), "Model-positive estimates", r.tradable || 0, r.checked || 0, cssv("--s1"), `${r.tradable || 0} of ${r.checked || 0} modeled gaps; includes historical estimates`);
+  meter($("m-fast"), "Closed within 1 slot", r.within_1_slot || 0, r.gaps || 0, cssv("--s1"), `${r.within_1_slot || 0} of ${r.gaps || 0} gaps (observed closure)`);
   const h = s.history || [];
   let live = 0; for (let i = 1; i < h.length; i++) if (h[i].updates > h[i - 1].updates) live++;
   const upFrac = h.length > 1 ? live / (h.length - 1) : 0;
@@ -413,8 +414,8 @@ function renderLive(s) {
   const now = Date.now() / 1000;
   renderTable("opengaps", "opengaps-empty", s.open_gaps, g => [g.watch, `${g.buy} → ${g.sell}`, `${Math.round(now - g.since)} s`,
     fmt(g.net_gap_pct, 3) + "%",
-    g.depth_best === null || g.depth_best === undefined ? "unknown (Meteora)"
-      : el("span", {class: g.depth_best >= g.min_profit ? "pos" : "neg", text: `${fmt(g.depth_best, 5)} SOL ${g.depth_best >= g.min_profit ? "tradable" : "not tradable"}`})]);
+    g.depth_best === null || g.depth_best === undefined ? "unverified depth"
+      : el("span", {class: g.depth_best >= g.min_profit ? "pos" : "neg", text: `${fmt(g.depth_best, 5)} SOL ${g.depth_best >= g.min_profit ? "model positive" : "below threshold"}`})]);
 }
 
 async function refresh() {
@@ -427,6 +428,9 @@ async function refresh() {
   $("t-gaps").textContent = fmt(s.stats.dislocations || 0, 0);
   $("t-open").textContent = s.watches.reduce((a, w) => a + w.open, 0);
   $("t-trad").textContent = fmt(s.stats.tradable || 0, 0);
+  const q = s.quality || {};
+  $("quality-status").textContent = `Freshness: ${(q.blocked_pairs || []).length} comparisons blocked; ${s.stats.quality_interrupted || 0} gap observations interrupted. Limits: ${q.max_state_age_s || 10}s / ${q.max_state_slot_lag ?? 8} slots. Execution remains unverified.`;
+  $("quality-status").title = (q.blocked_pairs || []).map(p => `${p.watch}: ${p.buy} / ${p.sell}: ${p.reason}`).join("; ");
   $("t-lag").textContent = s.latency ? `${s.latency.median_slots} slot${s.latency.median_slots === 1 ? "" : "s"}` : "–";
   $("alertpill").textContent = s.alerts_enabled ? "alerts on" : "alerts off";
   $("alertpill").className = "pill " + (s.alerts_enabled ? "ok" : "");

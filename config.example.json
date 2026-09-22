@@ -14,9 +14,23 @@
       "min_profit_quote": 0.0005,
       "shock_pct": 0.5,
       "pools": [
-        {"name": "Raydium AMM v4 xxxx", "address": "POOL_ADDRESS_1", "base_vault": "TOKEN_VAULT_1", "quote_vault": "SOL_VAULT_1", "fee": 0.0025},
-        {"name": "PumpSwap yyyy", "address": "POOL_ADDRESS_2", "base_vault": "TOKEN_VAULT_2", "quote_vault": "SOL_VAULT_2", "fee": 0.003}
+        {
+          "name": "Raydium AMM v4 xxxx",
+          "address": "POOL_ADDRESS_1",
+          "base_vault": "TOKEN_VAULT_1",
+          "quote_vault": "SOL_VAULT_1",
+          "fee": 0.0025
+        },
+        {
+          "name": "PumpSwap yyyy",
+          "address": "POOL_ADDRESS_2",
+          "base_vault": "TOKEN_VAULT_2",
+          "quote_vault": "SOL_VAULT_2",
+          "fee": 0.003
+        }
       ]
     }
-  ]
+  ],
+  "max_state_age_s": 10,
+  "max_state_slot_lag": 8
 }

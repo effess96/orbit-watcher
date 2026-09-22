@@ -1,0 +1,72 @@
+{
+  "source_files": {
+    "raw_updates.jsonl": {
+      "bytes": 67802726,
+      "sha256": "043c1ef891a3dd7603f7c8b02c357ef475110f0cef0ed64f13afbd5075213ebe"
+    },
+    "dislocations.csv": {
+      "bytes": 18561,
+      "sha256": "0b23a0cdb2deadf95ab1b11a719a46a9707de51445acaaffb43cb1b50e0e46cc"
+    },
+    "shocks.csv": {
+      "bytes": 17319,
+      "sha256": "03a422547bf502b7f14affc03e565664c675a6db4ae650e8589773008ffb87fc"
+    }
+  },
+  "observations": {
+    "account_updates": 555571,
+    "account_count": 25,
+    "first_utc": "2026-09-21T11:58:45.234000+00:00",
+    "last_utc": "2026-09-22T06:24:35.919000+00:00",
+    "hours": 18.430745833317438,
+    "control_records": 0,
+    "malformed_lines": 0
+  },
+  "results": {
+    "shocks": 190,
+    "closed_gaps": 116,
+    "historical_model_positive": 25,
+    "historical_model_negative": 75,
+    "depth_unknown": 16,
+    "closed_within_1_slot": 52,
+    "median_gap_seconds": 0.572,
+    "positive_gap_duration_over_1s": 6
+  },
+  "tokens": [
+    {
+      "token": "Bonk",
+      "closed_gaps": 15,
+      "historical_model_positive": 9,
+      "positive_gap_duration_over_1s": 0,
+      "depth_unknown": 0
+    },
+    {
+      "token": "Fartcoin",
+      "closed_gaps": 35,
+      "historical_model_positive": 13,
+      "positive_gap_duration_over_1s": 6,
+      "depth_unknown": 15
+    },
+    {
+      "token": "GOAT",
+      "closed_gaps": 58,
+      "historical_model_positive": 1,
+      "positive_gap_duration_over_1s": 0,
+      "depth_unknown": 0
+    },
+    {
+      "token": "POPCAT",
+      "closed_gaps": 8,
+      "historical_model_positive": 2,
+      "positive_gap_duration_over_1s": 0,
+      "depth_unknown": 1
+    }
+  ],
+  "limitations": [
+    "Historical classifications are preserved, not revalidated.",
+    "Gap duration does not establish that a positive depth estimate persisted.",
+    "Rows may overlap in time and share pools; counts are not independent trades.",
+    "No earnings or executable profitability can be derived from these exports.",
+    "Exact legacy replay requires deployed settings; evaluation timing was not recorded."
+  ]
+}

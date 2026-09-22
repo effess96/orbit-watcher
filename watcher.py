@@ -59,6 +59,30 @@ DEFAULT_MIN_PROFIT_SOL = 0.0005  # exact pairs: minimum net profit after cost
 DEFAULT_MIN_NET_GAP_PCT = 0.2    # other pairs: minimum price gap after all fees
 DEFAULT_BIG_SHOCK_PCT = 3.0      # a single-update move this large is an ANB-type event
 DEPTH_SIZES_SOL = (0.25, 1.0, 5.0)  # trade sizes simulated for the depth check
+EVIDENCE_VERSION = 1
+
+
+def research_config(config: dict) -> dict:
+    """Allowlisted replay settings. Never export RPC URLs or service credentials."""
+    pool_keys = {'name', 'address', 'kind', 'quote_mint', 'quote_decimals', 'fee',
+                 'base_vault', 'quote_vault', 'token_is_a', 'liquidity_usd'}
+    watch_keys = {'label', 'token_mint', 'token_decimals', 'quote_mint', 'quote_decimals',
+                  'cost_sol', 'cost_quote', 'min_profit_sol', 'min_profit_quote',
+                  'min_net_gap_pct', 'shock_pct', 'big_shock_pct', 'auto_until'}
+    out = {k: config[k] for k in ('commitment', 'evaluate_delay_ms',
+                                 'max_state_age_s', 'max_state_slot_lag') if k in config}
+    for key, default in (('commitment', 'processed'), ('evaluate_delay_ms', 150),
+                         ('max_state_age_s', 10), ('max_state_slot_lag', 8)):
+        out.setdefault(key, default)
+    out['watches'] = []
+    for w in config.get('watches', []):
+        item = {k: w[k] for k in watch_keys if k in w}
+        item.update(Watch(w).settings())
+        item['pools'] = [{k: p[k] for k in pool_keys if k in p} for p in w['pools']]
+        if w.get('sol_usdc'):
+            item['sol_usdc'] = {k: w['sol_usdc'][k] for k in pool_keys if k in w['sol_usdc']}
+        out['watches'].append(item)
+    return out
 
 # Constant-product pools: price = quote reserve / token reserve (read from vaults).
 # Value: (display name, default fee). Check the real fee of each pool.
@@ -218,7 +242,8 @@ def best_round_trip(cheap: tuple, rich: tuple) -> tuple[float, float]:
 DISLOCATION_FIELDS = ["opened_utc", "watch", "buy_pool", "sell_pool", "method", "open_slot", "close_slot",
                       "slots_open", "seconds_open", "peak_gap_pct", "peak_net_gap_pct", "peak_net_quote",
                       "best_size_quote", "quote", "depth_net_sol_0_25", "depth_net_sol_1",
-                      "depth_net_sol_5", "tradable"]
+                      "depth_net_sol_5", "tradable", "depth_status", "depth_reason",
+                      "execution_verified"]
 SHOCK_FIELDS = ["time_utc", "slot", "watch", "pool", "move_pct", "best_net_gap_pct_visible",
                 "best_net_quote_visible", "profitable_gap_visible", "quote"]
 
@@ -229,7 +254,7 @@ _D1 = ["opened_utc", "watch", "buy_pool", "sell_pool", "open_slot", "close_slot"
 _D2 = _D1[:4] + ["method"] + _D1[4:8] + ["peak_gap_pct", "peak_net_gap_pct", "peak_net_quote", "best_size_quote",
                                         "quote"]
 _S1 = ["time_utc", "slot", "watch", "pool", "move_pct", "best_net_quote_visible", "profitable_gap_visible", "quote"]
-CSV_HISTORY = {"dislocations.csv": [_D1, _D2], "shocks.csv": [_S1]}
+CSV_HISTORY = {"dislocations.csv": [_D1, _D2, DISLOCATION_FIELDS[:-3]], "shocks.csv": [_S1]}
 
 
 def migrate_csv(path: Path, fields: list[str]) -> None:
@@ -293,7 +318,7 @@ class Recorder:
         """One line per account update: vault balances ('a') or decoded pool state ('p', 'f')."""
         if not self.raw_fh:
             return
-        row = {"t": round(t, 3), "v": account, "s": slot}
+        row = {"t": t, "v": account, "s": slot}
         if amount is not None:
             row["a"] = amount
         else:
@@ -312,6 +337,12 @@ class Recorder:
         tmp = self.folder / (name + ".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
         tmp.replace(self.folder / name)
+
+    def event(self, kind: str, t: float, **data) -> None:
+        """Persist evaluation and lifecycle boundaries, not just account updates."""
+        if self.raw_fh:
+            self.raw_fh.write(json.dumps({'event': kind, 't': t, **data}) + '\n')
+            self.raw_fh.flush()
 
     def close(self) -> None:
         self.dislocations.close()
@@ -340,6 +371,10 @@ class Pool:
         self.qdec, self.tdec = int(qdec), int(token_decimals)
         self.quote_sym = QUOTE_SYMBOL.get(self.quote_mint, "quote")
         self.fee = float(d["fee"])
+        if not math.isfinite(self.fee) or not 0 <= self.fee < 1:
+            raise ValueError('Pool fee must be finite and in [0, 1).')
+        if not 0 <= self.qdec <= 18 or not 0 <= self.tdec <= 18:
+            raise ValueError('Token decimals must be between 0 and 18.')
         if self.kind == "cp":
             self.base_vault, self.quote_vault = d["base_vault"], d["quote_vault"]
         else:
@@ -350,6 +385,7 @@ class Pool:
         self.quote: int | None = None
         self.state_price: float | None = None
         self.slots: dict[str, int] = {}
+        self.arrivals: dict[str, float] = {}
         self.last_price: float | None = None
         self.suspect = False
         self.L: int | None = None        # Whirlpool/CLMM active liquidity (raw)
@@ -428,8 +464,13 @@ class Watch:
         self.min_net_gap = float(d.get("min_net_gap_pct", DEFAULT_MIN_NET_GAP_PCT)) / 100
         self.shock = float(d["shock_pct"]) / 100
         self.big_shock = float(d.get("big_shock_pct", DEFAULT_BIG_SHOCK_PCT)) / 100
+        if any(not math.isfinite(v) or v < 0 for v in
+               (self.cost_sol, self.min_profit_sol, self.min_net_gap, self.shock, self.big_shock)):
+            raise ValueError('Watch thresholds must be finite and non-negative.')
         self.auto_until = d.get("auto_until")
         self.pools = [Pool(p, tdec, wq, wqd) for p in d["pools"]]
+        if len({p.name for p in self.pools}) != len(self.pools):
+            raise ValueError('Pool names must be unique within a watch.')
         if len(self.pools) < 2:
             raise ValueError(f"Watch {self.label!r} needs at least two pools.")
         ref = d.get("sol_usdc")
@@ -450,6 +491,14 @@ class Engine:
     def __init__(self, config: dict, recorder: Recorder):
         self.watches = [Watch(w) for w in config["watches"]]
         self.rec = recorder
+        self.max_state_age = float(config.get('max_state_age_s', 10))
+        self.max_state_slot_lag = int(config.get('max_state_slot_lag', 8))
+        if not math.isfinite(self.max_state_age) or self.max_state_age <= 0 or self.max_state_slot_lag < 0:
+            raise ValueError('State freshness limits must be finite and positive (slot lag may be zero).')
+        self.blocked_pairs: dict[tuple, str] = {}
+        self.last_evaluated = 0.0
+        self.rec.event('session', time.time(), version=EVIDENCE_VERSION, config=research_config(config),
+                       source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
         self.acct: dict[str, list] = {}       # address -> [(watch, pool, role)]
         self.encoding: dict[str, str] = {}
         for w in self.watches:
@@ -461,7 +510,7 @@ class Engine:
         self.updates = 0
         self.dirty: set[int] = set()
         self.stats = {"shocks": 0, "shock_gaps": 0, "dislocations": 0, "interrupted": 0,
-                      "tradable": 0, "big_shocks": 0, "bin_steps": 0}
+                      "tradable": 0, "big_shocks": 0, "bin_steps": 0, "quality_interrupted": 0}
         self.warned: set[str] = set()
         self.on_event = None                   # callback(kind, data) for alerts
         self.tip_slot = 0                      # newest slot the RPC has announced
@@ -498,13 +547,14 @@ class Engine:
         return list(self.acct)
 
     # -- input --------------------------------------------------------------
-    def _apply(self, addr: str, slot: int, setter) -> bool:
+    def _apply(self, addr: str, slot: int, t: float, setter) -> bool:
         entries = self.acct.get(addr)
         if not entries or any(slot < p.slots.get(role, 0) for _, p, role in entries):
             return False  # unknown account, or older than what we already have
         for w, p, role in entries:
             setter(p, role)
             p.slots[role] = slot
+            p.arrivals[role] = t
             self.dirty.add(id(w))
         self.last_slot = max(self.last_slot, slot)
         self.updates += 1
@@ -512,13 +562,19 @@ class Engine:
 
     def on_vault(self, vault: str, amount: int, slot: int, t: float, log: bool = True) -> None:
         """New token balance of a constant-product pool vault."""
-        if self._apply(vault, slot, lambda p, role: setattr(p, role, int(amount))) and log:
+        if amount < 0 or not math.isfinite(t):
+            return
+        if self._apply(vault, slot, t, lambda p, role: setattr(p, role, int(amount))) and log:
             self.rec.raw(t, vault, slot, amount=int(amount))
 
     def on_state(self, addr: str, price: float, fee: float | None, slot: int, t: float, log: bool = True,
                  extra: dict | None = None) -> None:
         """New decoded price (and live fee, liquidity) of a concentrated-liquidity pool."""
         extra = extra or {}
+        if not math.isfinite(price) or price <= 0 or not math.isfinite(t):
+            return
+        if fee is not None and (not math.isfinite(fee) or not 0 <= fee < 1):
+            return
 
         def setter(p, role):
             p.state_price = price
@@ -528,7 +584,7 @@ class Engine:
                 p.L, p.sq = int(extra["L"]), float(extra["sq"])
             if "bin" in extra:
                 p.bin_step = float(extra["bin"])
-        if self._apply(addr, slot, setter) and log:
+        if self._apply(addr, slot, t, setter) and log:
             self.rec.raw(t, addr, slot, price=price, fee=fee, extra=extra)
 
     def on_account(self, addr: str, value, slot: int, t: float) -> None:
@@ -563,17 +619,51 @@ class Engine:
         return None
 
     def evaluate(self, t: float) -> None:
-        """Check every watch that changed since the last check."""
+        """Evaluate all watches so idle state expires too."""
+        self.last_evaluated = t
+        self.rec.event('evaluate', t, tip=self.tip_slot)
         for w in self.watches:
-            if id(w) in self.dirty:
-                self._evaluate_watch(w, t)
+            self._evaluate_watch(w, t)
         self.dirty.clear()
 
     def interrupt(self) -> None:
         """Connection lost: open gaps can no longer be timed honestly, so drop them."""
+        self.rec.event('interrupt', time.time())
+        self.blocked_pairs.clear()
         for w in self.watches:
             self.stats["interrupted"] += len(w.open)
             w.open.clear()
+            for p in w.pools + ([w.ref] if w.ref else []):
+                p.base = p.quote = p.state_price = p.last_price = None
+                p.L = p.sq = p.bin_step = None
+                p.slots.clear()
+                p.arrivals.clear()
+
+    def quality_reason(self, w: Watch, a: Pool, b: Pool, t: float) -> str:
+        if a.suspect or b.suspect:
+            return 'suspect_pool_price'
+        if self.to_sol(w, a) is None or self.to_sol(w, b) is None:
+            return 'missing_state_or_reference'
+        pools = [a, b] + ([w.ref] if w.ref and (a.quote_mint == USDC or b.quote_mint == USDC) else [])
+        slots = []
+        for p in pools:
+            roles = [role for _, role, _ in p.accounts()]
+            if not p.ready() or any(role not in p.arrivals for role in roles):
+                return 'missing_state'
+            if any(t - p.arrivals[role] > self.max_state_age or t < p.arrivals[role] for role in roles):
+                return 'state_age_exceeded'
+            slots.extend(p.slots[role] for role in roles)
+        if max(self.tip_slot, self.last_slot, max(slots)) - min(slots) > self.max_state_slot_lag:
+            return 'state_slot_lag_exceeded'
+        return ''
+
+    @staticmethod
+    def depth_reason(cheap: Pool, rich: Pool, cross: bool) -> str:
+        if cross:
+            return 'conversion_depth_unmodeled'
+        if cheap.kind != 'cp' or rich.kind != 'cp':
+            return 'tick_or_bin_depth_unavailable'
+        return ''
 
     def _check_suspects(self, w: Watch, pools: list, sol: dict) -> None:
         """A concentrated pool >50% away from the rest almost certainly means a decoding problem."""
@@ -588,7 +678,9 @@ class Engine:
                       "excluding it. Please report this.", flush=True)
 
     def _depth(self, w: Watch, cheap: Pool, rich: Pool, cross: bool) -> dict | None:
-        """Net SOL after fees and cost for a real round trip at each test size, or None if unknown."""
+        """Constant-product model estimate; never a verified executable return."""
+        if self.depth_reason(cheap, rich, cross):
+            return None
         if not (cheap.can_quote_depth() and rich.can_quote_depth()):
             return None
         conv = {}
@@ -618,9 +710,17 @@ class Engine:
         vis_gap: dict[int, float] = {}
         vis_net: dict[int, float] = {}
         vis_ok: dict[int, bool] = {}
-        for i in range(len(ready)):
-            for j in range(i + 1, len(ready)):
-                a, b = ready[i], ready[j]
+        for i in range(len(w.pools)):
+            for j in range(i + 1, len(w.pools)):
+                a, b = w.pools[i], w.pools[j]
+                key = (w.label, a.name, b.name)
+                reason = self.quality_reason(w, a, b, t)
+                if reason:
+                    self.blocked_pairs[key] = reason
+                    if w.open.pop((a.name, b.name), None) is not None:
+                        self.stats['quality_interrupted'] += 1
+                    continue
+                self.blocked_pairs.pop(key, None)
                 cheap, rich = (a, b) if sol[id(a)] <= sol[id(b)] else (b, a)
                 gap = sol[id(rich)] / sol[id(cheap)] - 1
                 cross = cheap.quote_mint != rich.quote_mint
@@ -670,12 +770,17 @@ class Engine:
 
     def _track(self, w, key, cheap, rich, gap, net_gap, method, size, net, ok, quote, t, depth=None) -> None:
         cur = w.open.get(key)
+        if ok and cur and (cur['buy'], cur['sell']) != (cheap.name, rich.name):
+            # A direction reversal is a new observation, never one continuous gap.
+            self._track(w, key, cheap, rich, gap, net_gap, method, size, net, False, quote, t, depth)
+            cur = None
         best = max(depth.values()) if depth else None
         if ok:
             if cur is None:
                 w.open[key] = dict(start=t, start_slot=self.last_slot, buy=cheap.name, sell=rich.name,
                                    method=method, peak_gap=gap, peak_net_gap=net_gap, peak_net=net,
-                                   size=size, quote=quote, depth=depth, depth_best=best)
+                                   size=size, quote=quote, depth=depth, depth_best=best,
+                                   depth_reason=self.depth_reason(cheap, rich, cheap.quote_mint != rich.quote_mint))
             else:
                 if best is not None and (cur["depth_best"] is None or best > cur["depth_best"]):
                     cur.update(depth=depth, depth_best=best)
@@ -702,7 +807,9 @@ class Engine:
                 "depth_net_sol_0_25": round(d[0.25], 6) if d else "",
                 "depth_net_sol_1": round(d[1.0], 6) if d else "",
                 "depth_net_sol_5": round(d[5.0], 6) if d else "",
-                "tradable": tradable}
+                "tradable": tradable,
+                "depth_status": 'unverified' if d is None else 'constant_product_estimate',
+                "depth_reason": cur['depth_reason'], "execution_verified": 'no'}
             self.rec.dislocations.write(row)
             self._emit("gap_closed", row)
             del w.open[key]
@@ -717,16 +824,23 @@ class Engine:
         for i in range(len(pools)):
             for j in range(i + 1, len(pools)):
                 (a, pa), (b, pb) = pools[i], pools[j]
+                if self.quality_reason(w, a, b, self.last_evaluated):
+                    continue
                 ref_fee = w.ref.fee if a.quote_mint != b.quote_mint and w.ref else 0.0
                 net = (max(pa, pb) / min(pa, pb)) * (1 - a.fee) * (1 - b.fee) * (1 - ref_fee) - 1
                 best = net if best is None else max(best, net)
         return None if best is None else best * 100
 
     def max_gap_pct(self, w: Watch) -> float | None:
-        prices = [s for p in w.pools if not p.suspect and (s := self.to_sol(w, p))]
-        if len(prices) < 2:
-            return None
-        return (max(prices) / min(prices) - 1) * 100
+        best = None
+        for i, a in enumerate(w.pools):
+            for b in w.pools[i + 1:]:
+                if self.quality_reason(w, a, b, self.last_evaluated):
+                    continue
+                pa, pb = self.to_sol(w, a), self.to_sol(w, b)
+                gap = (max(pa, pb) / min(pa, pb) - 1) * 100
+                best = gap if best is None else max(best, gap)
+        return best
 
 
 # ---------------------------------------------------------------------------
@@ -931,8 +1045,10 @@ class WebSocket:
             if not self.closed:
                 self.writer.write(ws_encode_frame(0x8, b"", True))
             self.writer.close()
-        except Exception:
+            await asyncio.wait_for(self.writer.wait_closed(), timeout=2)
+        except (OSError, asyncio.TimeoutError):
             pass
+        await asyncio.gather(self._task, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -940,14 +1056,15 @@ class WebSocket:
 # ---------------------------------------------------------------------------
 def snapshot(engine: Engine, rpc) -> None:
     """Load the current state of every vault and pool account before streaming changes."""
-    t = time.time()
     for enc in ("jsonParsed", "base64"):
         keys = [a for a in engine.vaults if engine.encoding[a] == enc]
-        if keys:
-            slot, values = get_multiple(rpc, keys, encoding=enc)
-            for addr, value in zip(keys, values):
+        for i in range(0, len(keys), 100):
+            batch = keys[i:i + 100]
+            slot, values = get_multiple(rpc, batch, encoding=enc)
+            t = time.time()
+            for addr, value in zip(batch, values):
                 engine.on_account(addr, value, slot, t)
-    engine.evaluate(t)
+    engine.evaluate(time.time())
 
 
 def print_status(engine: Engine, started: float) -> None:
@@ -998,12 +1115,13 @@ async def run_watch(config: dict, rpc, recorder: Recorder, ws_url: str, stop_aft
                                                              "commitment": commitment}]}))
             await ws.send(json.dumps({"jsonrpc": "2.0", "id": len(engine.vaults) + 1, "method": "slotSubscribe"}))
             backoff = first_backoff
-            last_ping = last_status = time.monotonic()
+            last_ping = last_status = last_evaluation = time.monotonic()
 
             def fire():
-                nonlocal timer
+                nonlocal timer, last_evaluation
                 timer = None
                 engine.evaluate(time.time())
+                last_evaluation = time.monotonic()
 
             while not stop_now():
                 try:
@@ -1011,6 +1129,9 @@ async def run_watch(config: dict, rpc, recorder: Recorder, ws_url: str, stop_aft
                 except asyncio.TimeoutError:
                     item = None
                 mono = time.monotonic()
+                if mono - last_evaluation >= 0.5:
+                    engine.evaluate(time.time())
+                    last_evaluation = mono
                 if mono - last_ping > 20:
                     await ws.ping()
                     last_ping = mono
@@ -1226,7 +1347,10 @@ def raw_span(path: Path) -> tuple[int, float]:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 try:
-                    t = json.loads(line)["t"]
+                    row = json.loads(line)
+                    if 'v' not in row:
+                        continue
+                    t = row['t']
                 except (ValueError, KeyError):
                     continue
                 count += 1
@@ -1247,7 +1371,7 @@ def report(folder: Path, raw_path: Path | None = None) -> str:
            f"Observed: {hours:.2f} hours, {updates} pool updates.", ""]
     vis = sum(1 for s in shocks if s["profitable_gap_visible"] == "yes")
     out.append(f"Shocks (one pool's price jumped in a single update): {len(shocks)}")
-    out.append(f"  ...with a profitable gap visible to this watcher: {vis} ({pct(vis, len(shocks))})")
+    out.append(f"  ...with a candidate gap visible to this watcher: {vis} ({pct(vis, len(shocks))})")
     out.append("")
     lat_file = folder / "latency.json"
     if lat_file.exists():
@@ -1258,13 +1382,12 @@ def report(folder: Path, raw_path: Path | None = None) -> str:
                           "1 slot is about 0.4 s.")
         except (ValueError, KeyError):
             pass
-    out.append(f"Profitable gaps seen and closed: {len(dis)}"
-               + (f"  (~{len(dis) / hours:.1f} per hour)" if hours > 0.05 else ""))
+    out.append(f"Candidate gaps seen and closed (CSV history): {len(dis)}")
     trad = [d for d in dis if d.get("tradable") == "yes"]
     checked = [d for d in dis if d.get("tradable") in ("yes", "no")]
     if checked or trad:
-        out.append(f"  tradable after depth check (0.25 / 1 / 5 SOL round trips): {len(trad)} of {len(checked)} "
-                   f"checked; {len(dis) - len(checked)} could not be depth-checked (Meteora or older rows)")
+        out.append(f"  model-positive depth estimates (0.25 / 1 / 5 SOL): {len(trad)} of {len(checked)} "
+                   f"checked; {len(dis) - len(checked)} have unverified depth")
     if dis:
         slots = [int(d["slots_open"]) for d in dis]
         secs = [float(d["seconds_open"]) for d in dis]
@@ -1284,58 +1407,72 @@ def report(folder: Path, raw_path: Path | None = None) -> str:
             out.append(line)
             for unit in sorted({d["quote"] for d in exact}):
                 nets = [float(d["peak_net_quote"]) for d in exact if d["quote"] == unit]
-                out.append(f"    exact pairs: median best net {statistics.median(nets):.6f} {unit}, "
-                           f"largest {max(nets):.6f} {unit}, sum of peaks {sum(nets):.6f} {unit}")
-    out += ["", "WHAT THIS MEANS"]
-    if hours < 1:
-        out.append("- Less than an hour of data. Let it run for a day or more before drawing conclusions.")
-    if checked and not trad:
-        out.append("- None of the depth-checked gaps survived a real round trip at 0.25, 1 or 5 SOL: the price "
-                   "difference existed, but the pools could not absorb even a small trade profitably.")
-    if trad:
-        out.append(f"- {len(trad)} gap(s) looked tradable after the depth check. Look at them one by one in "
-                   "dislocations.csv (columns depth_net_sol_*): how long they stayed open matters most.")
-    if not dis:
-        out.append("- No gap bigger than your cost assumption was visible. Either none happened, or they opened "
-                   "and closed inside one slot, before a home connection could even see them. Either way there "
-                   "was nothing a bot like Orbit could have captured on these pools.")
-    else:
-        fast = sum(int(d["slots_open"]) <= 2 for d in dis) / len(dis)
-        if fast >= 0.5:
-            out.append(f"- {fast:.0%} of gaps closed within about 0.8 seconds. To win one, a bot must see it, "
-                       "decide, sign and land a transaction inside that window, against searchers who run "
-                       "servers next to validators and pay Jito tips.")
-        else:
-            out.append("- Some gaps lasted several slots. Before getting excited, check them one by one: thin "
-                       "liquidity, token transfer taxes, frozen tokens or wrong fee settings often make a gap "
-                       "impossible to trade. Lasting gaps are usually untradable, not free money.")
-    out.append("- 'Net gap' is the price difference after both pools' fees (and the SOL/USDC swap fee for "
-               "cross-quote pairs). It says nothing about how much size the pools could take.")
-    out.append("- 'Best net' (exact Raydium/PumpSwap pairs only) is a ceiling from pool maths minus your cost "
-               "assumption, not a fill.")
+                out.append(f"    constant-product model: median peak net {statistics.median(nets):.6f} {unit}, "
+                           f"largest {max(nets):.6f} {unit}")
+    out += ["", "INTERPRETATION",
+            "- These are observed price signals and model estimates, not executed trades or earned profit.",
+            "- The legacy 'tradable' CSV field means only that a model passed its assumed cost threshold.",
+            "- Old rows without depth_status retain their original estimates; they have not been revalidated.",
+            "- Concentrated-pool tick/bin depth and cross-currency conversion depth are unverified.",
+            "- Constant-product estimates still omit route-specific reserve adjustments, token restrictions,",
+            "  actual landing costs and competition. Positive model outputs require transaction simulation.",
+            "- Gap lifetimes measure observed threshold crossings, not who traded or why prices changed.",
+            "- Peaks may overlap and are selected with hindsight. Never sum them as achievable earnings.",
+            "- Raw log rotation can shorten the recorded window while CSV history remains cumulative."]
     return "\n".join(out)
 
 
 def replay(config: dict, raw_path: Path, out_folder: Path) -> Engine:
-    """Re-run the analysis over saved raw updates, e.g. with different thresholds."""
+    """Replay recorded evaluation boundaries. Legacy logs use approximate slot grouping.
+
+    New session records contain the settings in force at collection time. They take
+    precedence over config; legacy logs still require a supplied configuration.
+    """
     rec = Recorder(out_folder, keep_raw=False)
     engine = Engine(config, rec)
-    current_slot, last_t = None, 0.0
-    with open(raw_path, encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                r = json.loads(line)
-            except ValueError:
-                continue
-            if current_slot is not None and r["s"] != current_slot:
-                engine.evaluate(last_t)
-            if "a" in r:
-                engine.on_vault(r["v"], r["a"], r["s"], r["t"], log=False)
-            elif "p" in r:
-                engine.on_state(r["v"], r["p"], r.get("f"), r["s"], r["t"], log=False, extra=r.get("x"))
-            current_slot, last_t = r["s"], r["t"]
-    engine.evaluate(last_t)
-    rec.close()
+    current_slot, last_t, recorded = None, 0.0, False
+    try:
+        with open(raw_path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    if recorded:
+                        raise ValueError('Malformed line in recorded session; exact replay refused.') from None
+                    continue
+                event = r.get('event')
+                if event == 'session':
+                    if r.get('version') != EVIDENCE_VERSION:
+                        raise ValueError('Unsupported evidence recording version.')
+                    if not recorded and current_slot is not None:
+                        print('Legacy prefix replay is approximate; recorded sessions use explicit timing.')
+                        engine.evaluate(last_t)
+                    engine = Engine(r['config'], rec)
+                    recorded = True
+                    continue
+                if event == 'evaluate':
+                    if not recorded:
+                        raise ValueError('Incomplete recording: evaluation found without session settings. Include the rotated log.')
+                    engine.note_tip(r.get('tip', 0))
+                    engine.evaluate(r['t'])
+                    continue
+                if event == 'interrupt':
+                    engine.interrupt()
+                    continue
+                if event or 'v' not in r:
+                    continue
+                if not recorded and current_slot is not None and r['s'] != current_slot:
+                    engine.evaluate(last_t)
+                if 'a' in r:
+                    engine.on_vault(r['v'], r['a'], r['s'], r['t'], log=False)
+                elif 'p' in r:
+                    engine.on_state(r['v'], r['p'], r.get('f'), r['s'], r['t'], log=False, extra=r.get('x'))
+                current_slot, last_t = r['s'], r['t']
+        if not recorded:
+            engine.evaluate(last_t)
+            print('Legacy replay: evaluation timing and connection boundaries were not recorded; results are approximate.')
+    finally:
+        rec.close()
     return engine
 
 
