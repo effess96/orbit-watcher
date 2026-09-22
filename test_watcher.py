@@ -680,11 +680,200 @@ class DepthAndSignals(TempDirCase):
         self.assertIn("behind the chain tip", text)
 
 
+def oracle_bytes(pool, control=4000, group=16, va=50000):
+    b = bytearray(254)
+    b[8:40] = W.b58decode(pool)
+    b[54:58], b[62:64], b[106:110] = control.to_bytes(4, "little"), group.to_bytes(2, "little"), va.to_bytes(4, "little")
+    return bytes(b)
+
+
+class OrcaAdaptiveFee(TempDirCase):
+    def test_curve_check_and_pda(self):
+        base_point = bytes([0x58] + [0x66] * 31)                       # ed25519 base point: on the curve
+        self.assertTrue(W.on_curve(base_point))
+        for program in (W.WHIRLPOOL_PROGRAM, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"):
+            self.assertTrue(W.on_curve(W.b58decode(program)))          # real keypairs are on the curve
+        pda = W.whirlpool_oracle_address(WHIRL)
+        self.assertFalse(W.on_curve(W.b58decode(pda)))                 # program addresses are never on it
+        self.assertEqual(pda, W.whirlpool_oracle_address(WHIRL))        # deterministic
+        self.assertNotEqual(pda, W.whirlpool_oracle_address(POOL_A))
+
+    def test_adaptive_fee_formula(self):
+        # crossed = 50000 * 16 = 800000; 4000 * 800000^2 / (100000 * 10000^2) = 256 millionths -> 0.0256%
+        self.assertAlmostEqual(W.adaptive_fee_rate(oracle_bytes(WHIRL)), 0.000256)
+        self.assertAlmostEqual(W.adaptive_fee_rate(oracle_bytes(WHIRL, va=500000)), 0.0256)
+        self.assertEqual(W.adaptive_fee_rate(oracle_bytes(WHIRL, va=0)), 0.0)
+        self.assertEqual(W.adaptive_fee_rate(oracle_bytes(WHIRL, va=10 ** 7)), 0.1)   # hard cap 10%
+
+    def config_with_oracle(self):
+        cfg = mixed_config()
+        self.oracle = W.whirlpool_oracle_address(WHIRL)
+        cfg["watches"][0]["pools"][1]["oracle"] = self.oracle
+        return cfg
+
+    def test_live_fee_is_base_plus_volatility(self):
+        rec = W.Recorder(self.dir)
+        self.addCleanup(rec.close)
+        e = W.Engine(self.config_with_oracle(), rec)
+        self.assertIn(self.oracle, e.vaults)
+        orca = e.watches[0].pools[1]
+        e.on_account(WHIRL, b64acct(whirl_bytes(TOKEN, W.WSOL, 1.0, 3000)), 100, 1000.0)
+        self.assertAlmostEqual(orca.fee, 0.003)
+        e.on_account(self.oracle, b64acct(oracle_bytes(WHIRL)), 101, 1000.1)
+        self.assertAlmostEqual(orca.fee, 0.003 + 0.000256)
+        e.on_account(WHIRL, b64acct(whirl_bytes(TOKEN, W.WSOL, 1.0, 1000)), 102, 1000.2)  # base fee changes
+        self.assertAlmostEqual(orca.fee, 0.001 + 0.000256)
+        e.on_account(self.oracle, b64acct(oracle_bytes(POOL_A, va=9999)), 103, 1000.3)   # wrong pool: ignored
+        self.assertAlmostEqual(orca.adaptive_fee, 0.000256)
+
+    def test_volatility_fee_closes_fake_gap_and_replays(self):
+        rec = W.Recorder(self.dir)
+        self.addCleanup(rec.close)
+        e = W.Engine(self.config_with_oracle(), rec)
+        e.on_vault(VA_T, 10 ** 12, 100, 1000.0)
+        e.on_vault(VA_Q, 10 ** 12, 100, 1000.0)
+        e.on_account(self.oracle, b64acct(oracle_bytes(WHIRL, va=500000)), 100, 1000.0)  # 2.56% fee
+        e.on_account(WHIRL, b64acct(whirl_bytes(TOKEN, W.WSOL, 1.02, 3000, 10 ** 16)), 100, 1000.0)    # +2% gap
+        e.evaluate(1000.0)
+        self.assertEqual(e.open_count(), 0)          # without the volatility fee this 2% gap would count
+        e.rec.raw_fh.flush()
+        again = W.replay(self.config_with_oracle(), self.dir / "raw_updates.jsonl", self.dir / "replay")
+        self.assertAlmostEqual(again.watches[0].pools[1].fee, 0.003 + 0.0256)
+
+    def test_upgrade_config_finds_oracle(self):
+        cfg = mixed_config()
+        oracle = W.whirlpool_oracle_address(WHIRL)
+        rpc = FakeRpc({}, {oracle: b64acct(oracle_bytes(WHIRL), W.WHIRLPOOL_PROGRAM)})
+        self.assertTrue(W.upgrade_config(cfg, rpc))
+        self.assertEqual(cfg["watches"][0]["pools"][1]["oracle"], oracle)
+        self.assertFalse(W.upgrade_config(cfg, rpc))                   # already done
+        cfg2 = mixed_config()
+        W.upgrade_config(cfg2, FakeRpc({}, {}))
+        self.assertIsNone(cfg2["watches"][0]["pools"][1]["oracle"])     # fixed-fee pool
+
+
 class NoTradingCode(unittest.TestCase):
     def test_no_signing_or_sending(self):
         src = Path(W.__file__).read_text()
         for word in ("sendTransaction", "sendBundle", "private_key", "secret_key", "Keypair", "signTransaction"):
             self.assertNotIn(word, src)
+
+
+class PoolEarningsTests(unittest.TestCase):
+    """Paper liquidity positions: fees from the on-chain fee counter, loss from price moves."""
+
+    def pool(self, token_is_a=True):
+        p = W.Pool({"name": "Orca X", "kind": "whirlpool", "address": WHIRL, "quote_mint": W.WSOL,
+                    "quote_decimals": 9, "token_is_a": token_is_a, "fee": 0.003}, 6)
+        self.move(p, 1.0)
+        p.fg = (0, 0)
+        return p
+
+    @staticmethod
+    def move(p, sq):
+        p.sq = sq                                   # raw sqrt price; human price follows from decimals
+        raw = sq * sq
+        p.state_price = raw * 1e-3 if p.token_is_a else 1e-3 / raw
+
+    def test_fee_growth_is_read_from_the_pool_account(self):
+        b = bytearray(whirl_bytes(TOKEN, W.WSOL, 1.0))
+        b[165:181], b[245:261] = (7 * 2 ** 64).to_bytes(16, "little"), (9 * 2 ** 64).to_bytes(16, "little")
+        x = W.state_extra("whirlpool", bytes(b))
+        self.assertEqual((x["fa"], x["fb"]), (7 * 2 ** 64, 9 * 2 ** 64))
+        c = bytearray(clmm_bytes(TOKEN, TOKEN, W.WSOL, 1.0))
+        c[277:293] = (5).to_bytes(16, "little")
+        self.assertEqual(W.state_extra("clmm", bytes(c))["fa"], 5)
+
+    def test_starts_at_exactly_the_paper_size_with_nothing_earned(self):
+        for side in (True, False):
+            sim = W.LpSim(self.pool(side), 0.05, 0.0)
+            r = sim.result()
+            self.assertAlmostEqual(sim._value(1.0), W.LP_START_VALUE, places=9)
+            self.assertAlmostEqual(r["fees_pct"], 0.0)
+            self.assertAlmostEqual(r["net_vs_hold_pct"], 0.0, places=9)
+
+    def test_fees_follow_the_fee_counter_while_in_range(self):
+        p = self.pool()
+        sim = W.LpSim(p, 0.05, 0.0)
+        p.fg = (0, 2 ** 64 * 1000)                   # 1000 raw lamports of fees per unit of liquidity
+        sim.observe(3600.0)
+        expected_sol = 1000 * sim.liq / 1e9
+        self.assertAlmostEqual(sim.fee_quote, expected_sol, places=12)
+        self.assertAlmostEqual(sim.result()["fees_pct"], round(expected_sol, 4), places=4)
+        self.assertEqual(sim.result()["in_range_pct"], 100.0)
+
+    def test_counter_wraparound_is_handled(self):
+        p = self.pool()
+        p.fg = (0, W.U128 - 10)
+        sim = W.LpSim(p, 0.05, 0.0)
+        p.fg = (0, 5)                                # the u128 counter wrapped: 15 units, not negative
+        sim.observe(10.0)
+        self.assertAlmostEqual(sim.fee_quote, 15 / 2 ** 64 * sim.liq / 1e9)
+
+    def test_price_moves_cost_money_versus_holding(self):
+        for side in (True, False):
+            p = self.pool(side)
+            sim = W.LpSim(p, 0.20, 0.0)
+            self.move(p, 1.05)                       # price about +10%, still inside +/-20%
+            sim.observe(60.0)
+            r = sim.result()
+            self.assertLess(r["price_move_pct"], 0)
+            self.assertGreater(r["price_move_pct"], -2)
+            self.assertAlmostEqual(r["net_vs_hold_pct"], r["price_move_pct"] + r["fees_pct"], places=3)
+
+    def test_no_fees_while_out_of_range(self):
+        p = self.pool()
+        sim = W.LpSim(p, 0.05, 0.0)
+        self.move(p, 1.2)                            # jumps out of the +/-5% range
+        sim.observe(10.0)
+        p.fg = (2 ** 64 * 50, 2 ** 64 * 50)
+        sim.observe(20.0)                            # was out of range for this whole interval
+        self.assertEqual((sim.fee_tok, sim.fee_quote), (0.0, 0.0))
+        self.assertFalse(sim.result()["in_range_now"])
+        self.assertAlmostEqual(sim.result()["in_range_pct"], 50.0)
+
+    def test_positions_survive_a_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "lp_state.json"
+            p = self.pool()
+            book = W.LpBook(path)
+            book.observe(p, 0.0)
+            p.fg = (0, 2 ** 64 * 400)
+            book.observe(p, 100.0)
+            book.save()
+            before = {k: s.fee_quote for k, s in book.sims.items()}
+            p2 = self.pool()
+            p2.fg = (0, 2 ** 64 * 600)               # fees kept accruing while the watcher was down
+            book2 = W.LpBook(path)
+            book2.observe(p2, 200.0)
+            for k, s in book2.sims.items():
+                self.assertEqual(s.t0, 0.0)
+                self.assertAlmostEqual(s.fee_quote, before[k] * 1.5, places=12)
+            self.assertEqual(len(book2.summary()), len(W.LP_RANGES))
+
+    def test_engine_feeds_positions_and_report_lists_them(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {"watches": [{"label": "X", "token_mint": TOKEN, "token_decimals": 6, "shock_pct": 0.5,
+                                "pools": [{"name": "Orca X", "kind": "whirlpool", "address": WHIRL,
+                                           "quote_mint": W.WSOL, "quote_decimals": 9, "token_is_a": True,
+                                           "fee": 0.003},
+                                          {"name": "Orca Y", "kind": "whirlpool", "address": POOL_A,
+                                           "quote_mint": W.WSOL, "quote_decimals": 9, "token_is_a": True,
+                                           "fee": 0.003}]}]}
+            rec = W.Recorder(Path(d))
+            e = W.Engine(cfg, rec)
+            for i, fb in enumerate((0, 2 ** 64 * 1000)):
+                b = bytearray(whirl_bytes(TOKEN, W.WSOL, 1.0, 3000, 10 ** 12))
+                b[245:261] = fb.to_bytes(16, "little")
+                e.on_account(WHIRL, {"data": [base64.b64encode(bytes(b)).decode(), "base64"]}, 10 + i, 3600.0 * i)
+            rows = e.lp.summary()
+            self.assertEqual({r["range_pct"] for r in rows}, {5, 20})
+            self.assertTrue(all(r["fees_pct"] > 0 for r in rows))
+            e.lp.save()
+            rec.close()
+            text = W.report(Path(d))
+            self.assertIn("POOL EARNINGS", text)
+            self.assertIn("Orca X", text)
 
 
 if __name__ == "__main__":

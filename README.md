@@ -118,6 +118,22 @@ $env:SOLANA_RPC_HTTP='https://YOUR-RPC-URL'
 $env:SOLANA_RPC_WS='wss://YOUR-RPC-URL'
 ```
 
+## Pool earnings (liquidity-provider research)
+
+For every Orca Whirlpool and Raydium CLMM pool you watch (plus the SOL/USDC reference pool, if it is one of
+those kinds), Orbit keeps two pretend liquidity positions of 100 SOL/USDC each: one over a price range of
+±5% and one over ±20%, centred on the price when tracking started. No money is involved.
+
+- **Fees earned** come from the pool's own on-chain fee counter, so they are what a real position that size
+  would have collected while the price was inside its range.
+- **Price-move loss** compares the position with simply holding the coins it started with (often called
+  impermanent loss).
+- **Net vs holding** = fees + price-move loss. Positive means providing liquidity beat holding.
+
+Positions are saved to `data/lp_state.json` every 30 seconds, so restarts don't reset them. Results show on
+the dashboard ("Pool earnings") and in the report. Judge them after several days: one sharp price move
+can wipe out weeks of fees, especially on memecoins. Meteora and constant-product pools are not measured.
+
 ## Output files (folder `data/`)
 
 - `dislocations.csv`: one row per profitable gap: which pools, when it opened, slots and seconds open, peak gap %, peak net profit, best trade size.

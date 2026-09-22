@@ -118,6 +118,15 @@ section,.watch{min-width:0}
   </div>
 
   <section>
+    <h2>Pool earnings (paper liquidity positions)</h2>
+    <div class="scroll"><table><thead><tr><th>Pool</th><th>Range</th><th>Tracked</th><th>In range</th><th>Fees earned</th><th>Fees per day</th><th>Price-move loss</th><th>Net vs holding</th></tr></thead>
+      <tbody id="lp"></tbody></table></div>
+    <div id="lp-empty" class="empty">Waiting for Orca or Raydium CLMM pool updates.</div>
+    <p class="note">A pretend 100 SOL/USDC position in each Orca and Raydium CLMM pool, over a price range of ±5% or ±20% set when tracking started. Fees come from each pool's own on-chain fee counter.
+      "Price-move loss" compares the position with simply holding the coins. "Net vs holding" = fees + that loss; green means providing liquidity beat holding. No real money is involved. Judge it after several days, not hours.</p>
+  </section>
+
+  <section>
     <h2>Open gaps right now</h2>
     <div class="scroll"><table><thead><tr><th>Watch</th><th>Buy → sell</th><th>Open for</th><th>After fees</th><th>Depth check</th></tr></thead>
       <tbody id="opengaps"></tbody></table></div>
@@ -443,6 +452,10 @@ async function refresh() {
   $("alert-list").replaceChildren(...(s.alerts.length ? s.alerts.map(a => el("div", {text: a})) : [el("div", {text: "No alerts yet."})]));
   renderWatches(s.watches);
   renderLive(s);
+  const pc = v => el("span", {class: v >= 0 ? "pos" : "neg", text: (v >= 0 ? "+" : "") + fmt(v, 3) + "%"});
+  renderTable("lp", "lp-empty", s.lp || [], r => [`${r.pool} (${r.quote})`, `±${r.range_pct}%`, `${fmt(r.hours, 1)} h`,
+    `${fmt(r.in_range_pct, 0)}%${r.in_range_now ? "" : " (out now)"}`, pc(r.fees_pct), pc(r.fees_per_day_pct),
+    pc(r.price_move_pct), pc(r.net_vs_hold_pct)]);
   renderTable("gaps", "gaps-empty", s.dislocations, r => [r.opened_utc.replace("T", " ").slice(0, 19), r.watch,
     `${r.buy_pool} → ${r.sell_pool}`, r.slots_open, r.seconds_open, fmt(r.peak_gap_pct, 3) + "%",
     fmt(r.peak_net_gap_pct, 3) + "%",

@@ -176,12 +176,19 @@ def adaptive_fee_rate(data: bytes) -> float:
     return min(rate, 100_000) / 1_000_000
 
 
+# Cumulative LP fees per unit of liquidity (Q64.64, token A/0 then B/1): Whirlpool, Raydium CLMM
+FEE_GROWTH_OFFSETS = {"whirlpool": (165, 245), "clmm": (277, 293)}
+
+
 def state_extra(kind: str, data: bytes) -> dict:
-    """Liquidity and exact sqrt price (Whirlpool/CLMM) or bin width (DLMM), for depth checks."""
-    if kind == "whirlpool":
-        return {"L": _u(data, 49, 16), "sq": _u(data, 65, 16) / 2 ** 64}
-    if kind == "clmm":
-        return {"L": _u(data, 237, 16), "sq": _u(data, 253, 16) / 2 ** 64}
+    """Liquidity, exact sqrt price and fee growth (Whirlpool/CLMM) or bin width (DLMM)."""
+    if kind in FEE_GROWTH_OFFSETS:
+        l_off, s_off = (49, 65) if kind == "whirlpool" else (237, 253)
+        fa, fb = FEE_GROWTH_OFFSETS[kind]
+        out = {"L": _u(data, l_off, 16), "sq": _u(data, s_off, 16) / 2 ** 64}
+        if len(data) >= fb + 16:
+            out["fa"], out["fb"] = _u(data, fa, 16), _u(data, fb, 16)
+        return out
     if kind == "dlmm":
         return {"bin": _u(data, 80, 2) / 10_000}
     return {}
@@ -399,6 +406,7 @@ class Pool:
         self.L: int | None = None        # Whirlpool/CLMM active liquidity (raw)
         self.sq: float | None = None     # sqrt(raw price of A in B)
         self.bin_step: float | None = None  # DLMM bin width as a fraction
+        self.fg: tuple[int, int] | None = None  # fee growth per liquidity (A, B), Q64.64
 
     def accounts(self) -> list[tuple[str, str, str]]:
         """(address, role, RPC encoding) for every account to subscribe to."""
@@ -493,6 +501,140 @@ class Watch:
                 "big_shock_pct": round(self.big_shock * 100, 6)}
 
 
+# ---------------------------------------------------------------------------
+# Pool earnings: a paper liquidity position in each Whirlpool / CLMM pool
+# ---------------------------------------------------------------------------
+LP_RANGES = (0.05, 0.20)     # position ranges: price +/-5% and +/-20% around the start price
+LP_START_VALUE = 100.0       # paper position size, in the pool's quote (SOL or USDC)
+Q64, U128 = 2 ** 64, 2 ** 128
+
+
+class LpSim:
+    """A pretend liquidity position in one pool, valued in the pool's quote.
+
+    Fees come from the pool's own on-chain fee counter (fee growth per unit of liquidity), so they
+    are what a real position of this size would have earned while the price stayed in its range.
+    Price-move loss compares the position with simply holding the coins it started with.
+    """
+
+    def __init__(self, pool: "Pool", width: float, t: float, state: dict | None = None):
+        self.pool, self.width = pool, width
+        if state:
+            self.__dict__.update({k: v for k, v in state.items() if k not in ("pool", "width")})
+            self.fg = tuple(self.fg)
+            return
+        s0 = pool.sq
+        self.sa, self.sb = s0 * math.sqrt(1 - width), s0 * math.sqrt(1 + width)
+        self.liq = 1.0
+        self.liq = LP_START_VALUE / self._value(s0)  # raw liquidity for a START-sized position
+        self.hold_tok, self.hold_quote = self._amounts(s0)
+        self.fee_tok = self.fee_quote = 0.0
+        self.fg, self.s_last = pool.fg, s0
+        self.t0 = self.t_last = t
+        self.in_range_s = 0.0
+
+    def _amounts(self, s: float) -> tuple[float, float]:
+        """(token, quote) in human units held by the position at sqrt price s."""
+        p, sc = self.pool, min(max(s, self.sa), self.sb)
+        return p_split(p, self.liq * (1 / sc - 1 / self.sb), self.liq * (sc - self.sa))
+
+    def _value(self, s: float) -> float:
+        tok, quote = self._amounts(s)
+        return tok * self.pool.price() + quote
+
+    def observe(self, t: float) -> None:
+        p = self.pool
+        in_range = self.sa <= self.s_last <= self.sb
+        if in_range:                                  # liquidity was active since the last update
+            self.in_range_s += max(0.0, t - self.t_last)
+            da = ((p.fg[0] - self.fg[0]) % U128) / Q64 * self.liq
+            db = ((p.fg[1] - self.fg[1]) % U128) / Q64 * self.liq
+            tok, quote = p_split(p, da, db)
+            self.fee_tok += tok
+            self.fee_quote += quote
+        self.fg, self.s_last, self.t_last = p.fg, p.sq, t
+
+    def result(self) -> dict:
+        price = self.pool.price()
+        lp_now = self._value(self.pool.sq)
+        fees = self.fee_tok * price + self.fee_quote
+        hold = self.hold_tok * price + self.hold_quote
+        hours = max(1e-9, (self.t_last - self.t0) / 3600)
+        pct = lambda x: 100 * x / LP_START_VALUE
+        return {"range_pct": round(self.width * 100), "hours": round(hours, 2),
+                "in_range_pct": round(100 * self.in_range_s / (hours * 3600), 1),
+                "fees_pct": round(pct(fees), 4), "fees_per_day_pct": round(pct(fees) * 24 / hours, 4),
+                "price_move_pct": round(pct(lp_now - hold), 4),
+                "net_vs_hold_pct": round(pct(lp_now + fees - hold), 4),
+                "in_range_now": self.sa <= self.pool.sq <= self.sb}
+
+    def state(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if k not in ("pool",)}
+
+
+def p_split(p: "Pool", a_raw: float, b_raw: float) -> tuple[float, float]:
+    """Raw pool-side amounts (A, B) -> (token, quote) in human units."""
+    if p.token_is_a:
+        return a_raw / 10 ** p.tdec, b_raw / 10 ** p.qdec
+    return b_raw / 10 ** p.tdec, a_raw / 10 ** p.qdec
+
+
+class LpBook:
+    """All paper positions; survives restarts through lp_state.json."""
+
+    def __init__(self, path: Path | None):
+        self.path, self.sims, self.saved = path, {}, {}
+        self.labels: dict[str, str] = {}
+        self._last_save = 0.0
+        if path and path.exists():
+            try:
+                self.saved = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                self.saved = {}
+
+    def observe(self, pool: "Pool", t: float) -> None:
+        if pool.kind not in FEE_GROWTH_OFFSETS or not (pool.fg and pool.sq and pool.ready()):
+            return
+        for width in LP_RANGES:
+            key = f"{pool.address}|{width}"
+            sim = self.sims.get(key)
+            if sim is None:
+                old = self.saved.get(key)
+                try:
+                    sim = LpSim(pool, width, t, old["sim"] if old else None)
+                except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                    sim = LpSim(pool, width, t)
+                self.sims[key] = sim
+            sim.pool = pool
+            sim.observe(t)
+        if self.path and time.monotonic() - self._last_save > 30:
+            self.save()
+
+    def summary(self) -> list[dict]:
+        rows = []
+        for key, sim in self.sims.items():
+            try:
+                rows.append({"pool": sim.pool.name, "address": sim.pool.address,
+                             "quote": sim.pool.quote_sym, **sim.result()})
+            except (ZeroDivisionError, TypeError, ValueError):
+                continue
+        return sorted(rows, key=lambda r: (-r["net_vs_hold_pct"], r["pool"]))
+
+    def save(self) -> None:
+        self._last_save = time.monotonic()
+        data = dict(self.saved)
+        for key, sim in self.sims.items():
+            data[key] = {"name": sim.pool.name, "sim": sim.state(), "result": sim.result()}
+        self.saved = data
+        try:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            tmp.replace(self.path)
+        except OSError:
+            pass
+
+
+
 class Engine:
     def __init__(self, config: dict, recorder: Recorder):
         self.watches = [Watch(w) for w in config["watches"]]
@@ -513,6 +655,7 @@ class Engine:
         self.on_event = None                   # callback(kind, data) for alerts
         self.tip_slot = 0                      # newest slot the RPC has announced
         self.lag_slots: collections.deque = collections.deque(maxlen=5000)
+        self.lp = LpBook(recorder.folder / "lp_state.json")
 
     def _emit(self, kind: str, data: dict) -> None:
         if self.on_event:
@@ -574,10 +717,14 @@ class Engine:
                 p.fee = min(0.1, fee + p.adaptive_fee)
             if "L" in extra:
                 p.L, p.sq = int(extra["L"]), float(extra["sq"])
+            if "fa" in extra:
+                p.fg = (int(extra["fa"]), int(extra["fb"]))
             if "bin" in extra:
                 p.bin_step = float(extra["bin"])
-        if self._apply(addr, slot, setter) and log:
-            self.rec.raw(t, addr, slot, price=price, fee=fee, extra=extra)
+        if self._apply(addr, slot, setter):
+            if log:
+                self.rec.raw(t, addr, slot, price=price, fee=fee, extra=extra)
+            self.lp.observe(self.acct[addr][0][1], t)
 
     def on_oracle(self, addr: str, rate: float, slot: int, t: float, log: bool = True) -> None:
         """New Orca adaptive (volatility) fee for a Whirlpool."""
@@ -1386,6 +1533,7 @@ def report(folder: Path, raw_path: Path | None = None) -> str:
                 nets = [float(d["peak_net_quote"]) for d in exact if d["quote"] == unit]
                 out.append(f"    exact pairs: median best net {statistics.median(nets):.6f} {unit}, "
                            f"largest {max(nets):.6f} {unit}, sum of peaks {sum(nets):.6f} {unit}")
+    out += lp_report(folder)
     out += ["", "WHAT THIS MEANS"]
     if hours < 1:
         out.append("- Less than an hour of data. Let it run for a day or more before drawing conclusions.")
@@ -1414,6 +1562,26 @@ def report(folder: Path, raw_path: Path | None = None) -> str:
     out.append("- 'Best net' (exact Raydium/PumpSwap pairs only) is a ceiling from pool maths minus your cost "
                "assumption, not a fill.")
     return "\n".join(out)
+
+
+def lp_report(folder: Path) -> list[str]:
+    path = folder / "lp_state.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        data = {}
+    rows = [(v["name"], v["result"]) for v in data.values() if "result" in v]
+    if not rows:
+        return []
+    out = ["", f"POOL EARNINGS (paper {LP_START_VALUE:.0f}-unit positions, Orca and Raydium CLMM pools only)",
+           "  range | pool | hours | in range | fees | fees/day | price-move loss | net vs holding"]
+    for name, r in sorted(rows, key=lambda x: -x[1]["net_vs_hold_pct"]):
+        out.append(f"  +/-{r['range_pct']}% | {name} | {r['hours']:.1f} h | {r['in_range_pct']:.0f}% | "
+                   f"{r['fees_pct']:+.3f}% | {r['fees_per_day_pct']:+.3f}% | {r['price_move_pct']:+.3f}% | "
+                   f"{r['net_vs_hold_pct']:+.3f}%")
+    out.append("  'Net vs holding' = fees + price-move loss. Positive means providing liquidity beat just holding "
+               "the coins. Less than 3 days of data says little: one big price move can erase weeks of fees.")
+    return out
 
 
 def replay(config: dict, raw_path: Path, out_folder: Path) -> Engine:

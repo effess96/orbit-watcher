@@ -262,7 +262,7 @@ class HunterAndAlerts(unittest.TestCase):
         app = self.app({"data": []})
         row = {"watch": "X", "buy_pool": "A", "sell_pool": "B", "peak_net_gap_pct": "0.5", "slots_open": "3",
                "seconds_open": "1.2", "depth_net_sol_0_25": "0.001", "depth_net_sol_1": "0.004",
-               "depth_net_sol_5": "-0.2", "tradable": "yes"}
+               "depth_net_sol_2_5": "-0.2", "tradable": "yes"}
         with contextlib.redirect_stdout(io.StringIO()):
             app.handle_event("gap_closed", row)
             app.handle_event("gap_closed", {**row, "tradable": "no"})            # not alerted

@@ -438,6 +438,7 @@ class App:
             "stats": dict(e.stats) if e else {}, "watches": watches,
             "rpc": "private" if os.environ.get("SOLANA_RPC_HTTP") else "public",
             "latency": e.latency_stats() if e else None,
+            "lp": e.lp.summary() if e else [],
             "history": list(self.history)[-720::2], "open_gaps": self.open_gaps(),
             "rates": {k: v for k, v in self.rates().items() if k != "t"},
             "min_net_gap_pct": min((w.min_net_gap * 100 for w in e.watches), default=0.2) if e else 0.2,
