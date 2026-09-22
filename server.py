@@ -226,6 +226,12 @@ class App:
 
     async def _run(self, cfg, http_url, ws_url) -> None:
         try:
+            try:
+                if await asyncio.to_thread(W.upgrade_config, cfg, self.rpc_factory(http_url)):
+                    self.save_config(cfg)
+                    print("Orca pools: adaptive-fee oracles located and saved.", flush=True)
+            except Exception as e:
+                print(f"Orca oracle check skipped ({e}).", flush=True)
             await W.run_watch(cfg, self.rpc_factory(http_url), self.recorder, ws_url,
                               first_backoff=self.first_backoff, eval_delay=self.eval_delay,
                               connect=self.connect, on_engine=self._attach)
@@ -287,7 +293,7 @@ class App:
     def handle_event(self, kind: str, data: dict) -> None:
         """Called by the engine: a gap closed or a big shock happened."""
         if kind == "gap_closed" and data.get("tradable") == "yes":
-            best = max(float(data[k]) for k in ("depth_net_sol_0_25", "depth_net_sol_1", "depth_net_sol_5"))
+            best = max(float(data[k]) for k in ("depth_net_sol_0_25", "depth_net_sol_1", "depth_net_sol_2_5"))
             text = (f"Orbit: tradable gap on {data['watch']}\n{data['buy_pool']} -> {data['sell_pool']}\n"
                     f"net after fees {data['peak_net_gap_pct']}%, best depth-checked net {best:.5f} SOL, "
                     f"open {data['slots_open']} slots ({data['seconds_open']} s). Read-only: no trade was made.")
@@ -417,6 +423,7 @@ class App:
                               "quote": W.QUOTE_SYMBOL.get(pc.get("quote_mint", wc.get("quote_mint")), "?"),
                               "fee": lp.fee if lp else pc["fee"],
                               "fee_editable": kind in ("cp", "clmm"), "liquidity_usd": pc.get("liquidity_usd"),
+                              "adaptive_fee": lp.adaptive_fee if lp and lp.oracle else None,
                               "price": lp.price() if lp and lp.ready() else None,
                               "suspect": bool(lp and lp.suspect)})
             ref = wc.get("sol_usdc")

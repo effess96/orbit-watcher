@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "0.3"
+VERSION = "0.4"
 ROOT = Path(__file__).resolve().parent
 USER_AGENT = f"orbit-dislocation-watcher/{VERSION}"
 
@@ -58,7 +58,7 @@ DEFAULT_COST_SOL = 0.0005        # cost per attempt: network fee + priority fee 
 DEFAULT_MIN_PROFIT_SOL = 0.0005  # exact pairs: minimum net profit after cost
 DEFAULT_MIN_NET_GAP_PCT = 0.2    # other pairs: minimum price gap after all fees
 DEFAULT_BIG_SHOCK_PCT = 3.0      # a single-update move this large is an ANB-type event
-DEPTH_SIZES_SOL = (0.25, 1.0, 5.0)  # trade sizes simulated for the depth check
+DEPTH_SIZES_SOL = (0.25, 1.0, 2.5)  # trade sizes simulated for the depth check (2.5 SOL ~ $300)
 
 # Constant-product pools: price = quote reserve / token reserve (read from vaults).
 # Value: (display name, default fee). Check the real fee of each pool.
@@ -136,6 +136,44 @@ def live_fee(kind: str, data: bytes) -> float | None:
         # run out of the token you want to buy, so the real price can be one bin away.
         return min(dlmm_fee(data) + _u(data, 80, 2) / 10_000, 0.2)
     return None  # CLMM fee lives in a separate config account
+
+
+WHIRLPOOL_PROGRAM = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+
+# ---- ed25519 / program-derived addresses (to find each Orca pool's fee oracle) ----
+_P = 2 ** 255 - 19
+_D = (-121665 * pow(121666, _P - 2, _P)) % _P
+
+
+def on_curve(key: bytes) -> bool:
+    """True if 32 bytes decode to a point on the ed25519 curve (PDAs must not)."""
+    y = (int.from_bytes(key, "little") & ((1 << 255) - 1)) % _P
+    u, v = (y * y - 1) % _P, (_D * y * y + 1) % _P
+    x2 = u * pow(v, _P - 2, _P) % _P
+    if x2 == 0:
+        return not key[31] >> 7
+    return pow(x2, (_P - 1) // 2, _P) == 1
+
+
+def find_program_address(seeds: list[bytes], program_id: str) -> str:
+    prog = b58decode(program_id)
+    for bump in range(255, -1, -1):
+        h = hashlib.sha256(b"".join(seeds) + bytes([bump]) + prog + b"ProgramDerivedAddress").digest()
+        if not on_curve(h):
+            return b58encode(h)
+    raise ValueError("no program address found")
+
+
+def whirlpool_oracle_address(pool: str) -> str:
+    return find_program_address([b"oracle", b58decode(pool)], WHIRLPOOL_PROGRAM)
+
+
+def adaptive_fee_rate(data: bytes) -> float:
+    """Orca adaptive (volatility) fee from an Oracle account, as a fraction (packed layout, 8-byte discriminator)."""
+    control, group = _u(data, 54, 4), _u(data, 62, 2)
+    crossed = _u(data, 106, 4) * group
+    rate = -(-(control * crossed * crossed) // (100_000 * 10_000 * 10_000))   # ceil division
+    return min(rate, 100_000) / 1_000_000
 
 
 def state_extra(kind: str, data: bytes) -> dict:
@@ -218,7 +256,7 @@ def best_round_trip(cheap: tuple, rich: tuple) -> tuple[float, float]:
 DISLOCATION_FIELDS = ["opened_utc", "watch", "buy_pool", "sell_pool", "method", "open_slot", "close_slot",
                       "slots_open", "seconds_open", "peak_gap_pct", "peak_net_gap_pct", "peak_net_quote",
                       "best_size_quote", "quote", "depth_net_sol_0_25", "depth_net_sol_1",
-                      "depth_net_sol_5", "tradable"]
+                      "depth_net_sol_2_5", "tradable"]
 SHOCK_FIELDS = ["time_utc", "slot", "watch", "pool", "move_pct", "best_net_gap_pct_visible",
                 "best_net_quote_visible", "profitable_gap_visible", "quote"]
 
@@ -229,7 +267,8 @@ _D1 = ["opened_utc", "watch", "buy_pool", "sell_pool", "open_slot", "close_slot"
 _D2 = _D1[:4] + ["method"] + _D1[4:8] + ["peak_gap_pct", "peak_net_gap_pct", "peak_net_quote", "best_size_quote",
                                         "quote"]
 _S1 = ["time_utc", "slot", "watch", "pool", "move_pct", "best_net_quote_visible", "profitable_gap_visible", "quote"]
-CSV_HISTORY = {"dislocations.csv": [_D1, _D2], "shocks.csv": [_S1]}
+_D3 = _D2 + ["depth_net_sol_0_25", "depth_net_sol_1", "depth_net_sol_5", "tradable"]
+CSV_HISTORY = {"dislocations.csv": [_D1, _D2, _D3], "shocks.csv": [_S1]}
 
 
 def migrate_csv(path: Path, fields: list[str]) -> None:
@@ -296,6 +335,8 @@ class Recorder:
         row = {"t": round(t, 3), "v": account, "s": slot}
         if amount is not None:
             row["a"] = amount
+        elif price is None and extra and "o" in extra:
+            row["o"] = extra["o"]
         else:
             row["p"] = price
             if fee is not None:
@@ -346,6 +387,9 @@ class Pool:
             if not self.address:
                 raise ValueError(f"Pool {self.name!r} needs its address")
             self.token_is_a = bool(d["token_is_a"])
+        self.oracle = d.get("oracle") if self.kind == "whirlpool" else None
+        self.base_fee = self.fee
+        self.adaptive_fee = 0.0
         self.base: int | None = None
         self.quote: int | None = None
         self.state_price: float | None = None
@@ -360,7 +404,10 @@ class Pool:
         """(address, role, RPC encoding) for every account to subscribe to."""
         if self.kind == "cp":
             return [(self.base_vault, "base", "jsonParsed"), (self.quote_vault, "quote", "jsonParsed")]
-        return [(self.address, "state", "base64")]
+        out = [(self.address, "state", "base64")]
+        if self.oracle:
+            out.append((self.oracle, "oracle", "base64"))
+        return out
 
     def ready(self) -> bool:
         if self.kind == "cp":
@@ -523,13 +570,22 @@ class Engine:
         def setter(p, role):
             p.state_price = price
             if fee is not None:
-                p.fee = fee
+                p.base_fee = fee
+                p.fee = min(0.1, fee + p.adaptive_fee)
             if "L" in extra:
                 p.L, p.sq = int(extra["L"]), float(extra["sq"])
             if "bin" in extra:
                 p.bin_step = float(extra["bin"])
         if self._apply(addr, slot, setter) and log:
             self.rec.raw(t, addr, slot, price=price, fee=fee, extra=extra)
+
+    def on_oracle(self, addr: str, rate: float, slot: int, t: float, log: bool = True) -> None:
+        """New Orca adaptive (volatility) fee for a Whirlpool."""
+        def setter(p, role):
+            p.adaptive_fee = rate
+            p.fee = min(0.1, p.base_fee + rate)
+        if self._apply(addr, slot, setter) and log:
+            self.rec.raw(t, addr, slot, extra={"o": rate})
 
     def on_account(self, addr: str, value, slot: int, t: float) -> None:
         """Raw RPC account value (snapshot or live notification)."""
@@ -542,6 +598,16 @@ class Engine:
             return
         entries = self.acct.get(addr)
         if not entries:
+            return
+        if entries[0][2] == "oracle":
+            try:
+                data = base64.b64decode(value["data"][0])
+                if b58encode(data[8:40]) != entries[0][1].address:
+                    return                      # not this pool's oracle: ignore
+                rate = adaptive_fee_rate(data)
+            except (KeyError, TypeError, ValueError, IndexError):
+                return
+            self.on_oracle(addr, rate, slot, t)
             return
         try:
             data = base64.b64decode(value["data"][0])
@@ -701,7 +767,7 @@ class Engine:
                 "quote": cur["quote"],
                 "depth_net_sol_0_25": round(d[0.25], 6) if d else "",
                 "depth_net_sol_1": round(d[1.0], 6) if d else "",
-                "depth_net_sol_5": round(d[5.0], 6) if d else "",
+                "depth_net_sol_2_5": round(d[2.5], 6) if d else "",
                 "tradable": tradable}
             self.rec.dislocations.write(row)
             self._emit("gap_closed", row)
@@ -970,6 +1036,11 @@ def print_status(engine: Engine, started: float) -> None:
 async def run_watch(config: dict, rpc, recorder: Recorder, ws_url: str, stop_after: float | None = None,
                     status_every: float = 60, first_backoff: float = 2, eval_delay: float | None = None,
                     connect=WebSocket.connect, on_engine=None) -> Engine:
+    try:
+        if await asyncio.to_thread(upgrade_config, config, rpc):
+            print("Orca pools: adaptive-fee oracles located and added.", flush=True)
+    except Exception as e:
+        print(f"Could not check Orca fee oracles yet ({e}); using base fees.", flush=True)
     engine = Engine(config, recorder)
     if on_engine:
         on_engine(engine)
@@ -1153,15 +1224,44 @@ def find_pools(mint: str, rpc, pairs: list[dict], quotes: set[str], max_pools: i
                     notes.append(f"note {addr[:8]}… ({dex}): fee not readable, assuming 0.25%")
             else:
                 fee = live_fee(kind, data)
-            pools.append(dict(name=f"{dex} {addr[:4]}", kind=kind, address=addr, quote_mint=other,
-                              quote_decimals=decimals[other], token_is_a=(ma == mint), fee=round(fee, 8),
-                              liquidity_usd=round(liq)))
+            entry = dict(name=f"{dex} {addr[:4]}", kind=kind, address=addr, quote_mint=other,
+                         quote_decimals=decimals[other], token_is_a=(ma == mint), fee=round(fee, 8),
+                         liquidity_usd=round(liq))
+            if kind == "whirlpool":
+                entry["oracle"] = find_oracle(rpc, addr)
+                if entry["oracle"]:
+                    notes.append(f"note {addr[:8]}… (Orca): adaptive volatility fee is tracked live")
+            pools.append(entry)
         else:
             name = KNOWN_UNSUPPORTED.get(owner, f"program {owner[:8]}…")
             notes.append(f"skip {addr[:8]}… ({name}): pool type not supported")
             continue
         notes.append(f"ok   {addr[:8]}… {pools[-1]['name'].rsplit(' ', 1)[0]} vs {qsym}, liquidity ${liq:,.0f}")
     return pools, notes, symbol, decimals.get(mint)
+
+
+def find_oracle(rpc, pool: str) -> str | None:
+    """Address of an Orca pool's adaptive-fee oracle, or None if the pool has a fixed fee."""
+    oracle = whirlpool_oracle_address(pool)
+    acct = rpc.call("getAccountInfo", [oracle, {"encoding": "base64"}])["value"]
+    if not acct or acct.get("owner") != WHIRLPOOL_PROGRAM:
+        return None
+    data = base64.b64decode(acct["data"][0])
+    return oracle if len(data) >= 110 and b58encode(data[8:40]) == pool else None
+
+
+def upgrade_config(cfg: dict, rpc) -> bool:
+    """Add oracle addresses to Orca pools saved by older versions. Returns True if anything changed."""
+    changed = False
+    for w in cfg.get("watches", []):
+        for p in w.get("pools", []):
+            if p.get("kind") == "whirlpool" and "oracle" not in p:
+                try:
+                    p["oracle"] = find_oracle(rpc, p["address"])
+                except (RuntimeError, KeyError, TypeError, ValueError):
+                    continue
+                changed = True
+    return changed
 
 
 def reference_pool(rpc, fetch=fetch_json) -> tuple[dict | None, str]:
@@ -1263,7 +1363,7 @@ def report(folder: Path, raw_path: Path | None = None) -> str:
     trad = [d for d in dis if d.get("tradable") == "yes"]
     checked = [d for d in dis if d.get("tradable") in ("yes", "no")]
     if checked or trad:
-        out.append(f"  tradable after depth check (0.25 / 1 / 5 SOL round trips): {len(trad)} of {len(checked)} "
+        out.append(f"  tradable after depth check (0.25 / 1 / 2.5 SOL round trips): {len(trad)} of {len(checked)} "
                    f"checked; {len(dis) - len(checked)} could not be depth-checked (Meteora or older rows)")
     if dis:
         slots = [int(d["slots_open"]) for d in dis]
@@ -1331,6 +1431,8 @@ def replay(config: dict, raw_path: Path, out_folder: Path) -> Engine:
                 engine.evaluate(last_t)
             if "a" in r:
                 engine.on_vault(r["v"], r["a"], r["s"], r["t"], log=False)
+            elif "o" in r:
+                engine.on_oracle(r["v"], r["o"], r["s"], r["t"], log=False)
             elif "p" in r:
                 engine.on_state(r["v"], r["p"], r.get("f"), r["s"], r["t"], log=False, extra=r.get("x"))
             current_slot, last_t = r["s"], r["t"]

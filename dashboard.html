@@ -209,6 +209,7 @@ const dur = s => { const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60)
 let watchSig = "";
 const KIND = {cp: "constant product", whirlpool: "Orca Whirlpool", clmm: "Raydium CLMM", dlmm: "Meteora DLMM (fee + 1 bin)"};
 const pct = f => fmt(f * 100, 4) + "%";
+const feeText = p => pct(p.fee) + " live" + (p.adaptive_fee ? ` (incl. ${pct(p.adaptive_fee)} volatility)` : "");
 function renderWatches(ws) {
   const sig = JSON.stringify(ws.map(w => [w.label, w.cost_sol, w.min_profit_sol, w.min_net_gap_pct, w.shock_pct,
     w.pools.map(p => [p.name, p.fee_editable ? p.fee : null, p.suspect])]));
@@ -220,7 +221,7 @@ function renderWatches(ws) {
       card.querySelector(".openv").textContent = w.open;
       w.pools.forEach((p, j) => {
         const c = card.querySelectorAll(".price")[j]; if (c) c.textContent = p.price === null ? "–" : `${fmt(p.price, 10)} ${p.quote}`;
-        const f = card.querySelectorAll(".livefee")[j]; if (f && !p.fee_editable) f.textContent = pct(p.fee) + " live";
+        const f = card.querySelectorAll(".livefee")[j]; if (f && !p.fee_editable) f.textContent = feeText(p);
       });
     });
     return;
@@ -239,7 +240,7 @@ function renderWatches(ws) {
       el("td", {class: "price", text: p.price === null ? "–" : `${fmt(p.price, 10)} ${p.quote}`}),
       el("td", {class: "livefee"}, p.fee_editable
         ? (feeInputs[p.name] = el("input", {type: "number", step: "0.0005", value: p.fee}))
-        : pct(p.fee) + " live"),
+        : feeText(p)),
       el("td", {class: p.liquidity_usd !== null && p.liquidity_usd !== undefined && p.liquidity_usd < 10000 ? "neg" : "",
                 text: p.liquidity_usd ? "$" + fmt(p.liquidity_usd, 0) : "–"}),
       el("td", {}, el("button", {class: "danger", text: "Drop", title: "Stop watching this pool", onclick: async () => {
@@ -285,7 +286,7 @@ function renderWatches(ws) {
 
 function depthCell(r) {
   if (r.tradable === "yes") {
-    const best = Math.max(...["depth_net_sol_0_25", "depth_net_sol_1", "depth_net_sol_5"].map(k => Number(r[k])));
+    const best = Math.max(...["depth_net_sol_0_25", "depth_net_sol_1", "depth_net_sol_2_5"].map(k => Number(r[k])));
     return el("span", {class: "pos", text: `tradable, ${fmt(best, 5)} SOL`});
   }
   if (r.tradable === "no") return el("span", {class: "neg", text: "not tradable"});
