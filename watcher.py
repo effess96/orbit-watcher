@@ -506,6 +506,10 @@ class Watch:
 # ---------------------------------------------------------------------------
 LP_RANGES = (0.05, 0.20)     # position ranges: price +/-5% and +/-20% around the start price
 LP_START_VALUE = 100.0       # paper position size, in the pool's quote (SOL or USDC)
+MAX_FEE_STEP = 0.01          # sanity cap: one update can add at most 1% of the position in fees
+MAX_FEE_TOTAL = 10.0         # sanity cap: total fees above 1000% of the position mean something broke
+LP_CAPITAL_SOL = float(os.environ.get("ORBIT_LP_CAPITAL_SOL", 2.5))   # your money, for the SOL columns
+LP_TX_COST_SOL = 0.001       # network fees to open and later close a position (both directions)
 Q64, U128 = 2 ** 64, 2 ** 128
 
 
@@ -522,6 +526,12 @@ class LpSim:
         if state:
             self.__dict__.update({k: v for k, v in state.items() if k not in ("pool", "width")})
             self.fg = tuple(self.fg)
+            self.skipped = int(getattr(self, "skipped", 0))
+            self.slot = int(getattr(self, "slot", 0))
+            self.worst = float(getattr(self, "worst", 0.0))
+            self.best = float(getattr(self, "best", 0.0))
+            if not self.sane():
+                raise ValueError("restored position is not sane")
             return
         s0 = pool.sq
         self.sa, self.sb = s0 * math.sqrt(1 - width), s0 * math.sqrt(1 + width)
@@ -532,6 +542,10 @@ class LpSim:
         self.fg, self.s_last = pool.fg, s0
         self.t0 = self.t_last = t
         self.in_range_s = 0.0
+        self.skipped = 0
+        self.slot = 0
+        self.worst = 0.0        # lowest "net vs holding" this position has been through
+        self.best = 0.0
 
     def _amounts(self, s: float) -> tuple[float, float]:
         """(token, quote) in human units held by the position at sqrt price s."""
@@ -542,17 +556,40 @@ class LpSim:
         tok, quote = self._amounts(s)
         return tok * self.pool.price() + quote
 
-    def observe(self, t: float) -> None:
+    def observe(self, t: float, slot: int = 0) -> None:
         p = self.pool
+        if slot and slot <= getattr(self, "slot", 0):
+            return                                    # same or older pool state: never count it twice
         in_range = self.sa <= self.s_last <= self.sb
         if in_range:                                  # liquidity was active since the last update
             self.in_range_s += max(0.0, t - self.t_last)
-            da = ((p.fg[0] - self.fg[0]) % U128) / Q64 * self.liq
-            db = ((p.fg[1] - self.fg[1]) % U128) / Q64 * self.liq
-            tok, quote = p_split(p, da, db)
-            self.fee_tok += tok
-            self.fee_quote += quote
-        self.fg, self.s_last, self.t_last = p.fg, p.sq, t
+            raw = [p.fg[i] - self.fg[i] for i in (0, 1)]
+            if all(0 <= d < U128 // 2 for d in raw):  # a counter that went backwards is stale data, not income
+                tok, quote = p_split(p, raw[0] / Q64 * self.liq, raw[1] / Q64 * self.liq)
+                gain = tok * p.price() + quote
+                if 0 <= gain <= LP_START_VALUE * MAX_FEE_STEP:   # one update cannot earn a big share of the position
+                    self.fee_tok += tok
+                    self.fee_quote += quote
+                else:
+                    self.skipped += 1
+            else:
+                self.skipped += 1
+        self.fg, self.s_last, self.t_last, self.slot = p.fg, p.sq, t, slot or getattr(self, "slot", 0)
+
+    def sane(self) -> bool:
+        """False if this position's numbers stopped making sense (bad restore, garbled counter)."""
+        try:
+            vals = [self.liq, self.fee_tok, self.fee_quote, self._value(self.pool.sq)]
+        except (TypeError, ValueError, ZeroDivisionError):
+            return False
+        if not all(math.isfinite(v) for v in vals):
+            return False
+        fees = self.fee_tok * self.pool.price() + self.fee_quote
+        return -1e-9 <= fees <= LP_START_VALUE * MAX_FEE_TOTAL and self.liq > 0
+
+    def cost_sol(self) -> float:
+        """What opening and later closing this position would cost: network fees plus the swaps in and out."""
+        return LP_TX_COST_SOL + LP_CAPITAL_SOL * self.pool.base_fee
 
     def result(self) -> dict:
         price = self.pool.price()
@@ -561,11 +598,21 @@ class LpSim:
         hold = self.hold_tok * price + self.hold_quote
         hours = max(1e-9, (self.t_last - self.t0) / 3600)
         pct = lambda x: 100 * x / LP_START_VALUE
+        net = pct(lp_now + fees - hold)
+        self.worst, self.best = min(self.worst, net), max(self.best, net)
+        per_day = net * 24 / hours                       # net vs holding, at today's pace, in % per day
+        sol_day = per_day / 100 * LP_CAPITAL_SOL
+        cost = self.cost_sol()
+        days = round(cost / sol_day, 1) if sol_day > 1e-12 else None
         return {"range_pct": round(self.width * 100), "hours": round(hours, 2),
                 "in_range_pct": round(100 * self.in_range_s / (hours * 3600), 1),
                 "fees_pct": round(pct(fees), 4), "fees_per_day_pct": round(pct(fees) * 24 / hours, 4),
                 "price_move_pct": round(pct(lp_now - hold), 4),
-                "net_vs_hold_pct": round(pct(lp_now + fees - hold), 4),
+                "net_vs_hold_pct": round(net, 4), "worst_net_pct": round(self.worst, 4),
+                "best_net_pct": round(self.best, 4),
+                "capital_sol": LP_CAPITAL_SOL, "cost_sol": round(cost, 5),
+                "net_sol_per_day": round(sol_day, 5), "days_to_break_even": days,
+                "skipped_updates": self.skipped,
                 "in_range_now": self.sa <= self.pool.sq <= self.sb}
 
     def state(self) -> dict:
@@ -584,7 +631,7 @@ class LpBook:
 
     def __init__(self, path: Path | None):
         self.path, self.sims, self.saved = path, {}, {}
-        self.labels: dict[str, str] = {}
+        self.restarted = 0
         self._last_save = 0.0
         if path and path.exists():
             try:
@@ -592,21 +639,25 @@ class LpBook:
             except (OSError, ValueError):
                 self.saved = {}
 
-    def observe(self, pool: "Pool", t: float) -> None:
+    def observe(self, pool: "Pool", t: float, slot: int = 0) -> None:
         if pool.kind not in FEE_GROWTH_OFFSETS or not (pool.fg and pool.sq and pool.ready()):
             return
         for width in LP_RANGES:
             key = f"{pool.address}|{width}"
             sim = self.sims.get(key)
             if sim is None:
-                old = self.saved.get(key)
+                prev = self.saved.get(key)
                 try:
-                    sim = LpSim(pool, width, t, old["sim"] if old else None)
+                    sim = LpSim(pool, width, t, prev["sim"] if prev else None)
                 except (KeyError, TypeError, ValueError, ZeroDivisionError):
-                    sim = LpSim(pool, width, t)
+                    sim = LpSim(pool, width, t)   # unusable history: start this position again
+                    self.restarted += 1
                 self.sims[key] = sim
             sim.pool = pool
-            sim.observe(t)
+            sim.observe(t, slot)
+            if not sim.sane():                    # numbers went impossible: start this position again
+                self.sims[key] = LpSim(pool, width, t)
+                self.restarted += 1
         if self.path and time.monotonic() - self._last_save > 30:
             self.save()
 
@@ -619,6 +670,15 @@ class LpBook:
             except (ZeroDivisionError, TypeError, ValueError):
                 continue
         return sorted(rows, key=lambda r: (-r["net_vs_hold_pct"], r["pool"]))
+
+    def reset(self) -> None:
+        """Forget every paper position and start again from the current prices."""
+        self.sims, self.saved = {}, {}
+        if self.path:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
 
     def save(self) -> None:
         self._last_save = time.monotonic()
@@ -724,7 +784,7 @@ class Engine:
         if self._apply(addr, slot, setter):
             if log:
                 self.rec.raw(t, addr, slot, price=price, fee=fee, extra=extra)
-            self.lp.observe(self.acct[addr][0][1], t)
+            self.lp.observe(self.acct[addr][0][1], t, slot)
 
     def on_oracle(self, addr: str, rate: float, slot: int, t: float, log: bool = True) -> None:
         """New Orca adaptive (volatility) fee for a Whirlpool."""
@@ -1573,14 +1633,21 @@ def lp_report(folder: Path) -> list[str]:
     rows = [(v["name"], v["result"]) for v in data.values() if "result" in v]
     if not rows:
         return []
+    cap = rows[0][1].get("capital_sol", LP_CAPITAL_SOL)
     out = ["", f"POOL EARNINGS (paper {LP_START_VALUE:.0f}-unit positions, Orca and Raydium CLMM pools only)",
-           "  range | pool | hours | in range | fees | fees/day | price-move loss | net vs holding"]
+           "  range | pool | hours | in range | fees | fees/day | price-move loss | net vs holding | "
+           f"worst so far | on {cap:g} SOL/day | days to break even"]
     for name, r in sorted(rows, key=lambda x: -x[1]["net_vs_hold_pct"]):
+        days = r.get("days_to_break_even")
         out.append(f"  +/-{r['range_pct']}% | {name} | {r['hours']:.1f} h | {r['in_range_pct']:.0f}% | "
                    f"{r['fees_pct']:+.3f}% | {r['fees_per_day_pct']:+.3f}% | {r['price_move_pct']:+.3f}% | "
-                   f"{r['net_vs_hold_pct']:+.3f}%")
+                   f"{r['net_vs_hold_pct']:+.3f}% | {r.get('worst_net_pct', 0):+.3f}% | "
+                   f"{r.get('net_sol_per_day', 0):+.5f} SOL | " + (f"{days:.1f}" if days else "never at this pace"))
     out.append("  'Net vs holding' = fees + price-move loss. Positive means providing liquidity beat just holding "
                "the coins. Less than 3 days of data says little: one big price move can erase weeks of fees.")
+    out.append(f"  'On {cap:g} SOL/day' is today's pace applied to your own capital. 'Days to break even' compares "
+               f"that with what opening and closing the position costs (network fees plus the swaps in and out). "
+               "'Worst so far' is the lowest this position has been: an average hides a bad stretch.")
     return out
 
 

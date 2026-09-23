@@ -238,6 +238,18 @@ class HunterAndAlerts(unittest.TestCase):
         return S.App(Path(tmp.name), PASSWORD, fetch=fetch, rpc_factory=lambda url: FakeRpc(start_accounts(), RAW),
                      notifier=S.Notifier("t", "c", sender=self.sent.append))
 
+    def test_reset_earnings_clears_positions_and_history(self):
+        app = self.app({"data": []})
+        self.assertFalse(app.reset_earnings())                                # nothing running yet
+        app.engine = W.Engine({"watches": []}, W.Recorder(Path(app.out), keep_raw=False))
+        self.addCleanup(app.engine.rec.close)
+        app.engine.lp.sims["pool|0.05"] = object()
+        app.history.append({"t": 1})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(app.reset_earnings())
+        self.assertEqual(app.engine.lp.sims, {})
+        self.assertEqual(len(app.history), 0)
+
     def test_hunter_adds_temporary_watch_once_and_expires_it(self):
         app = self.app(gecko(POOL_A, TOKEN, W.WSOL, 50_000))
         with contextlib.redirect_stdout(io.StringIO()):

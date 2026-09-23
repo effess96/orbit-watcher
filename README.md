@@ -129,8 +129,15 @@ those kinds), Orbit keeps two pretend liquidity positions of 100 SOL/USDC each: 
 - **Price-move loss** compares the position with simply holding the coins it started with (often called
   impermanent loss).
 - **Net vs holding** = fees + price-move loss. Positive means providing liquidity beat holding.
+- **Worst so far** is the lowest that position has been, so a bad stretch is not hidden by an average.
+- **On your SOL / day** applies today's pace to your own capital (set `ORBIT_LP_CAPITAL_SOL`, default 2.5 SOL).
+- **Days to break even** compares that with the cost of opening and closing the position: network fees plus
+  the swaps in and out (the pool's own fee on your capital).
 
-Positions are saved to `data/lp_state.json` every 30 seconds, so restarts don't reset them. Results show on
+Positions are saved to `data/lp_state.json` every 30 seconds, so restarts don't reset them. Odd pool
+readings (a fee counter that appears to move backwards, an impossible one-update jump, or the same slot
+seen twice) are ignored and counted as "odd pool readings ignored"; a position whose numbers stop making
+sense is started again automatically. "Reset tracking" on the dashboard starts every position from scratch. Results show on
 the dashboard ("Pool earnings") and in the report. Judge them after several days: one sharp price move
 can wipe out weeks of fees, especially on memecoins. Meteora and constant-product pools are not measured.
 

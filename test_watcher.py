@@ -792,23 +792,121 @@ class PoolEarningsTests(unittest.TestCase):
             self.assertAlmostEqual(r["fees_pct"], 0.0)
             self.assertAlmostEqual(r["net_vs_hold_pct"], 0.0, places=9)
 
+    @staticmethod
+    def per_unit(sim, sol):
+        """Fee-counter step (Q64.64) that pays this position `sol` of quote fees."""
+        return int(sol * 1e9 / sim.liq * 2 ** 64)
+
     def test_fees_follow_the_fee_counter_while_in_range(self):
         p = self.pool()
         sim = W.LpSim(p, 0.05, 0.0)
-        p.fg = (0, 2 ** 64 * 1000)                   # 1000 raw lamports of fees per unit of liquidity
+        p.fg = (0, self.per_unit(sim, 0.4))          # 0.4 SOL of fees on a 100 SOL position
         sim.observe(3600.0)
-        expected_sol = 1000 * sim.liq / 1e9
-        self.assertAlmostEqual(sim.fee_quote, expected_sol, places=12)
-        self.assertAlmostEqual(sim.result()["fees_pct"], round(expected_sol, 4), places=4)
+        self.assertAlmostEqual(sim.fee_quote, 0.4, places=6)
+        self.assertAlmostEqual(sim.result()["fees_pct"], 0.4, places=3)
         self.assertEqual(sim.result()["in_range_pct"], 100.0)
+        self.assertEqual(sim.result()["skipped_updates"], 0)
+
+    def test_counter_going_backwards_is_ignored(self):
+        """A stale read (snapshot behind the live stream) must not look like a giant payout."""
+        p = self.pool()
+        p.fg = (0, 10 ** 12)
+        sim = W.LpSim(p, 0.05, 0.0)
+        p.fg = (0, 10 ** 12 - 5)                     # counter appears to go back: stale data
+        sim.observe(10.0)
+        self.assertEqual((sim.fee_tok, sim.fee_quote), (0.0, 0.0))
+        self.assertEqual(sim.result()["skipped_updates"], 1)
+        self.assertTrue(sim.sane())
+
+    def test_absurd_single_step_is_skipped(self):
+        p = self.pool()
+        sim = W.LpSim(p, 0.05, 0.0)
+        p.fg = (0, self.per_unit(sim, 50))           # half the position in one update: impossible
+        sim.observe(10.0)
+        self.assertEqual(sim.fee_quote, 0.0)
+        self.assertEqual(sim.result()["skipped_updates"], 1)
+
+    def test_same_slot_is_not_counted_twice(self):
+        p = self.pool()
+        sim = W.LpSim(p, 0.05, 0.0)
+        p.fg = (0, self.per_unit(sim, 0.2))
+        sim.observe(10.0, slot=100)
+        sim.observe(11.0, slot=100)                  # snapshot replays the same slot
+        sim.observe(12.0, slot=99)                   # and an older one
+        self.assertAlmostEqual(sim.fee_quote, 0.2, places=6)
+
+    def test_broken_position_restarts_itself(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "lp_state.json"
+            p = self.pool()
+            book = W.LpBook(path)
+            book.observe(p, 0.0)
+            book.save()
+            bad = json.loads(path.read_text(encoding="utf-8"))
+            for v in bad.values():
+                v["sim"]["fee_quote"] = 1e12         # nonsense left by an earlier bug
+            path.write_text(json.dumps(bad), encoding="utf-8")
+            book2 = W.LpBook(path)
+            book2.observe(self.pool(), 100.0)
+            self.assertEqual(book2.restarted, len(W.LP_RANGES))
+            for r in book2.summary():
+                self.assertLess(abs(r["fees_pct"]), 1)
+                self.assertEqual(r["hours"], 0.0)
+
+    def test_sol_figures_costs_and_break_even(self):
+        p = self.pool()
+        p.base_fee = 0.003
+        sim = W.LpSim(p, 0.05, 0.0)
+        p.fg = (0, self.per_unit(sim, 0.5))          # 0.5% of the position in fees over an hour
+        sim.observe(3600.0)
+        r = sim.result()
+        self.assertAlmostEqual(r["capital_sol"], W.LP_CAPITAL_SOL)
+        self.assertAlmostEqual(r["cost_sol"], W.LP_TX_COST_SOL + W.LP_CAPITAL_SOL * 0.003, places=6)
+        self.assertAlmostEqual(r["net_sol_per_day"], 0.12 * W.LP_CAPITAL_SOL, places=3)   # 0.5%/h = 12%/day
+        self.assertAlmostEqual(r["days_to_break_even"], round(r["cost_sol"] / r["net_sol_per_day"], 1), places=6)
+
+    def test_losing_position_never_breaks_even(self):
+        p = self.pool()
+        sim = W.LpSim(p, 0.20, 0.0)
+        self.move(p, 1.05)                           # price moves, no fees earned
+        sim.observe(3600.0)
+        r = sim.result()
+        self.assertLess(r["net_sol_per_day"], 0)
+        self.assertIsNone(r["days_to_break_even"])
+
+    def test_worst_stretch_is_remembered(self):
+        p = self.pool()
+        sim = W.LpSim(p, 0.20, 0.0)
+        self.move(p, 1.08)                           # a bad stretch
+        sim.observe(60.0)
+        low = sim.result()["net_vs_hold_pct"]
+        self.assertLess(low, 0)
+        self.move(p, 1.0)                            # price comes back
+        p.fg = (0, self.per_unit(sim, 0.3))
+        sim.observe(120.0)
+        r = sim.result()
+        self.assertGreater(r["net_vs_hold_pct"], 0)
+        self.assertAlmostEqual(r["worst_net_pct"], low, places=4)   # the bad stretch stays on record
+
+    def test_reset_clears_every_position(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "lp_state.json"
+            book = W.LpBook(path)
+            book.observe(self.pool(), 0.0)
+            book.save()
+            self.assertTrue(path.exists())
+            book.reset()
+            self.assertEqual(book.summary(), [])
+            self.assertFalse(path.exists())
 
     def test_counter_wraparound_is_handled(self):
         p = self.pool()
         p.fg = (0, W.U128 - 10)
         sim = W.LpSim(p, 0.05, 0.0)
-        p.fg = (0, 5)                                # the u128 counter wrapped: 15 units, not negative
+        p.fg = (0, 5)                                # a true u128 wrap is a tiny step, not a payout
         sim.observe(10.0)
-        self.assertAlmostEqual(sim.fee_quote, 15 / 2 ** 64 * sim.liq / 1e9)
+        self.assertLess(sim.fee_quote, 1e-6)
+        self.assertTrue(sim.sane())
 
     def test_price_moves_cost_money_versus_holding(self):
         for side in (True, False):
@@ -838,12 +936,12 @@ class PoolEarningsTests(unittest.TestCase):
             p = self.pool()
             book = W.LpBook(path)
             book.observe(p, 0.0)
-            p.fg = (0, 2 ** 64 * 400)
+            p.fg = (0, 2 ** 64 // 10 ** 7)
             book.observe(p, 100.0)
             book.save()
             before = {k: s.fee_quote for k, s in book.sims.items()}
             p2 = self.pool()
-            p2.fg = (0, 2 ** 64 * 600)               # fees kept accruing while the watcher was down
+            p2.fg = (0, 2 ** 64 // 10 ** 7 * 3 // 2)  # fees kept accruing while the watcher was down
             book2 = W.LpBook(path)
             book2.observe(p2, 200.0)
             for k, s in book2.sims.items():
@@ -862,7 +960,7 @@ class PoolEarningsTests(unittest.TestCase):
                                            "fee": 0.003}]}]}
             rec = W.Recorder(Path(d))
             e = W.Engine(cfg, rec)
-            for i, fb in enumerate((0, 2 ** 64 * 1000)):
+            for i, fb in enumerate((0, 2 ** 64 // 10 ** 6)):
                 b = bytearray(whirl_bytes(TOKEN, W.WSOL, 1.0, 3000, 10 ** 12))
                 b[245:261] = fb.to_bytes(16, "little")
                 e.on_account(WHIRL, {"data": [base64.b64encode(bytes(b)).decode(), "base64"]}, 10 + i, 3600.0 * i)

@@ -283,6 +283,16 @@ class App:
                                             and int(r["slots_open"]) <= 1)}
         return self._rates
 
+    def reset_earnings(self) -> bool:
+        """Forget all paper positions and start them again from current prices."""
+        e = self.engine
+        if not e:
+            return False
+        e.lp.reset()
+        self.history.clear()
+        print("Pool earnings tracking reset: all paper positions start again from now.", flush=True)
+        return True
+
     def lp_rows(self) -> list[dict]:
         """Pool-earnings rows, each tagged with the watch (token) it belongs to."""
         e = self.engine
@@ -679,6 +689,8 @@ def make_handler(app: App):
                 if path == "/api/test-alert":
                     ok = app.notifier.send("Orbit: test alert. Alerts are working.", force=True)
                     return self.json({"ok": ok, "enabled": app.notifier.enabled})
+                if path == "/api/lp/reset":
+                    return self.json({"ok": app.reset_earnings()})
                 if path == "/api/restart":
                     app.request_restart()
                     return self.json({"ok": True})
