@@ -2017,6 +2017,39 @@ def pct(part: int, whole: int) -> str:
     return f"{100 * part / whole:.0f}%" if whole else "n/a"
 
 
+def mood_report(folder: Path) -> list[str]:
+    """Market mood section, from regime.json (written by the server's background worker)."""
+    try:
+        m = json.loads((folder / "regime.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    c, sol = m.get("composite", {}), m.get("sol", {})
+    out = ["MARKET MOOD (describes conditions; not a buy or sell signal)",
+           f"  Crypto regime: {c.get('zone')} (score {c.get('score')}/100) as of {m.get('as_of')}. {c.get('guidance', '')}"]
+    for comp in m.get("components", {}).values():
+        if comp.get("data_available"):
+            out.append(f"  {comp['label']} ({comp['weight'] * 100:.0f}%): {comp['score']} - {comp['signal']}")
+        else:
+            out.append(f"  {comp['label']}: skipped - {comp['signal']}")
+    if sol.get("price"):
+        out.append(f"  SOL: ${sol['price']:,.2f}; 30-day change {sol.get('change_30d_pct')}%; 30-day volatility "
+                   f"{sol.get('vol30')}%/yr; trend: {sol.get('signal')}")
+    out.append("  LP weather (last 90 days, daily closes; % of windows the price stayed inside the range):")
+    out.append("  token | vs | 3 days +/-5% | 3 days +/-20% | 7 days +/-5% | 7 days +/-20% | typical 7-day move | weather")
+    for t in m.get("tokens", []):
+        for vs in ("sol", "usd"):
+            w = t.get(f"vs_{vs}")
+            if w:
+                out.append(f"  {t['watch']} | {vs.upper()} | {w['in_3d_5']:.0f}% | {w['in_3d_20']:.0f}% | "
+                           f"{w['in_7d_5']:.0f}% | {w['in_7d_20']:.0f}% | {w['median_move_7d']:.1f}% | {t['weather']}")
+        if not (t.get("vs_sol") or t.get("vs_usd")):
+            out.append(f"  {t['watch']} | - | {t.get('note') or 'no data'}")
+    out.append("  'Calm' = stayed within +/-20% over 90%+ of 3-day windows: a range position there mostly keeps "
+               "earning fees. 'Stormy' = under 70%: price moves are likely to beat the fees. Daily closes hide "
+               "intraday swings, so real figures are a little worse.")
+    return out + [""]
+
+
 def raw_archive_totals(folder: Path) -> tuple[int, float]:
     """(updates, hours) already moved into compressed raw archives."""
     try:
@@ -2035,6 +2068,7 @@ def report(folder: Path, raw_path: Path | None = None) -> str:
         updates, hours = updates + u2, hours + h2
     out = ["ORBIT DISLOCATION WATCHER — REPORT", "=" * 34,
            f"Observed: {hours:.2f} hours, {updates} pool updates.", ""]
+    out += mood_report(folder)
     vis = sum(1 for s in shocks if s["profitable_gap_visible"] == "yes")
     out.append(f"Shocks (one pool's price jumped in a single update): {len(shocks)}")
     out.append(f"  ...with a profitable gap visible to this watcher: {vis} ({pct(vis, len(shocks))})")

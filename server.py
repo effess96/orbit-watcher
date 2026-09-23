@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import regime as R
 import watcher as W
 
 ROOT = Path(__file__).resolve().parent
@@ -52,7 +53,8 @@ DOWNLOADS = {"dislocations.csv": "text/csv", "shocks.csv": "text/csv", "loops.cs
              "closers.csv": "text/csv", "quote_checks.csv": "text/csv",
              "raw_updates.jsonl": "application/x-ndjson"}
 BUNDLE_FILES = ("dislocations.csv", "shocks.csv", "loops.csv", "closers.csv", "quote_checks.csv",
-                "lp_state.json", "latency.json")
+                "lp_state.json", "latency.json", "regime.json", "regime_log.jsonl")
+MOOD_EVERY_S = 6 * 3600          # market mood refresh (heavy fetches happen once a day; the rest hit the cache)
 ARCHIVE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 SECRET_IN_TEXT = re.compile(r"(api[-_]?key=)[^&\s\"']+|(bot)\d+:[A-Za-z0-9_-]+", re.I)
 
@@ -190,6 +192,12 @@ class App:
         self.archive = self.out / "archive"
         self.raw_started = time.time()
         self.raw_lock = threading.Lock()
+        self.mood: dict | None = None
+        self.mood_status = {"state": "waiting", "error": "", "last_try": None}
+        try:
+            self.mood = json.loads((self.out / "regime.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
 
     # -- config -------------------------------------------------------------
     def config(self) -> dict:
@@ -223,6 +231,8 @@ class App:
             threading.Thread(target=self._compress_raw, args=(moved,), daemon=True).start()
         await self.restart()
         asyncio.get_running_loop().create_task(self._sample_loop())
+        if os.environ.get("ORBIT_MOOD", "1") != "0":
+            threading.Thread(target=self._mood_loop, daemon=True).start()
         while True:
             await asyncio.sleep(30)
             self.maintain()
@@ -336,6 +346,42 @@ class App:
         print(f"Pool earnings tracking reset: all paper positions start again from now "
               f"(old results kept in archive {name}).", flush=True)
         return True
+
+    # -- market mood (crypto regime + LP weather) ---------------------------------
+    def run_mood_once(self, data: "R.RegimeData | None" = None) -> dict:
+        self.mood_status.update(state="fetching", last_try=time.time())
+        data = data or R.RegimeData(self.out / "regime_cache", log=lambda m: print(m, flush=True))
+        result = R.analyse(data, R.watches_for_mood(self.config()))
+        self.out.mkdir(parents=True, exist_ok=True)
+        old = (self.mood or {}).get("composite", {}).get("zone")
+        self.mood = result
+        tmp = self.out / "regime.tmp"
+        tmp.write_text(json.dumps(result, indent=1), encoding="utf-8")
+        tmp.replace(self.out / "regime.json")
+        c = result["composite"]
+        with open(self.out / "regime_log.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"t": result["t"], "score": c.get("score"), "zone": c.get("zone"),
+                                 "sol": result["sol"].get("price"), "sol_vol30": result["sol"].get("vol30"),
+                                 "weather": {t["watch"]: t["weather"] for t in result["tokens"]}}) + "\n")
+        self.mood_status.update(state="ok", error="")
+        print(f"Market mood: {c.get('zone')} (score {c.get('score')}/100); "
+              f"{result['requests']} requests in {result['seconds']} s", flush=True)
+        if old and c.get("zone") != old:
+            self.notifier.send(f"Orbit market mood changed: {old} -> {c.get('zone')} (score {c.get('score')}/100). "
+                               "Descriptive only, not a trade signal.", force=True)
+        return result
+
+    def _mood_loop(self, first_wait: float = 60) -> None:
+        time.sleep(first_wait)
+        while True:
+            try:
+                self.run_mood_once()
+                wait = MOOD_EVERY_S
+            except Exception as e:
+                self.mood_status.update(state="error", error=f"{type(e).__name__}: {e}"[:200])
+                print(f"Market mood: failed ({type(e).__name__}: {e}); retrying in 30 min", flush=True)
+                wait = 1800
+            time.sleep(wait)
 
     # -- archives ---------------------------------------------------------------
     def save_archive(self, reason: str = "manual") -> str:
@@ -677,6 +723,7 @@ class App:
             "rpc": "private" if os.environ.get("SOLANA_RPC_HTTP") else "public",
             "latency": e.latency_stats() if e else None,
             "lp": self.lp_rows(),
+            "mood": self.mood, "mood_status": self.mood_status,
             "audit": self.audit_summary(),
             "loops": self.loop_state(),
             "history": list(self.history)[-720::2], "open_gaps": self.open_gaps(),

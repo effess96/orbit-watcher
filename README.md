@@ -176,6 +176,19 @@ vaults would show gaps that are not real.
 - `archive/reports/<time>-<why>/`: a copy of the report, CSVs and earnings, saved automatically before every
   "Reset tracking" and whenever you press "Save a copy now".
 
+## Market mood (crypto regime + LP weather)
+
+A background job (every 6 hours) scores the crypto market from 0 (risk-off) to 100 (risk-on) using the six
+components of the crypto-regime-analyzer skill from github.com/tradermonty/claude-trading-skills (MIT; the scoring
+files are copied unchanged into `regime_skill/`, with the licence in `regime_skill/NOTICE`). Orbit fetches the data
+itself with the standard library: CoinGecko's free API, plus funding from Binance or, if Binance blocks the server's
+region, OKX. BTC dominance needs 31 days of daily readings before it counts; until then its weight is shared out.
+
+Orbit adds "LP weather": for each of your tokens, how often its price (against SOL and the dollar) stayed within
++/-5% and +/-20% over 3-day and 7-day stretches in the last 90 days. Results go to `regime.json`, one line per run
+to `regime_log.jsonl`, a MARKET MOOD section in the report, and a Telegram alert when the zone changes.
+Set `ORBIT_MOOD=0` to turn it off. It describes the market; it is not a buy or sell signal.
+
 ## Saved reports and the analysis bundle
 
 The dashboard's "Saved reports & data" section lists earlier reports and compressed raw files, each downloadable.

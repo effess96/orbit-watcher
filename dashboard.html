@@ -52,6 +52,7 @@ a{color:var(--blue)}
 .mt{margin-top:10px}
 :root{--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;
 --good:#0ca30c;--warning:#fab219;--critical:#d03b3b;--grid:#2c2c2a;--axis:#383835;--muted:#898781;--track:#1d2a3a}
+.gauge .big{font-size:28px;font-weight:600;margin:6px 0}
 .gauges{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
 .gauge{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .gauge .k{color:var(--muted);font-size:12px}
@@ -138,6 +139,22 @@ section,.watch{min-width:0}
       <p class="note">How busy the watched pools are. Drops to zero mean the data stream stalled.</p>
     </section>
   </div>
+
+  <section>
+    <h2>Market mood <span class="note" id="mood-age"></span></h2>
+    <div class="gauges">
+      <div class="gauge"><div class="k">Crypto regime (0 = risk-off, 100 = risk-on)</div><div id="g-mood"></div></div>
+      <div class="gauge"><div class="k">What's driving it</div><div id="mood-comps"></div></div>
+      <div class="gauge"><div class="k">SOL</div><div id="mood-sol"></div></div>
+    </div>
+    <h3>LP weather: how often each token's price stayed inside the range (last 90 days)</h3>
+    <div class="scroll"><table><thead><tr><th>Token</th><th>Against</th><th>3 days ±5%</th><th>3 days ±20%</th>
+      <th>7 days ±5%</th><th>7 days ±20%</th><th>Typical 7-day move</th><th>Weather</th></tr></thead><tbody id="mood-weather"></tbody></table></div>
+    <div id="mood-weather-empty" class="empty">The first reading arrives about 5–7 minutes after Orbit starts (CoinGecko's free tier is slow on purpose).</div>
+    <p class="note">Describes the market; it is not a buy or sell signal. Regime scoring comes from the crypto-regime-analyzer skill (tradermonty, MIT licence).
+      "Calm" means the price stayed within ±20% over 90%+ of 3-day stretches, so a range position there mostly keeps earning fees; "stormy" means under 70%, where price moves tend to beat the fees.
+      Daily closes hide intraday swings, so real figures are a little worse. Refreshes every 6 hours; you get a Telegram alert when the regime changes zone.</p>
+  </section>
 
   <section>
     <h2>Earnings overview</h2>
@@ -619,6 +636,42 @@ function bars(host, rows, emptyText) {
   }));
 }
 
+function renderMood(s) {
+  const m = s.mood, st = s.mood_status || {}, good = cssv("--good"), bad = cssv("--critical"), warn = cssv("--warning");
+  if (!m) {
+    gauge($("g-mood"), 0, "–", st.state === "error" ? "error: " + st.error : st.state === "fetching" ? "fetching (takes ~5 min)…" : "waiting for first reading", cssv("--muted"));
+    $("mood-age").textContent = ""; renderTable("mood-weather", "mood-weather-empty", [], r => []); return;
+  }
+  const c = m.composite || {}, sc = c.score, col = c.zone === "RISK_ON" ? good : c.zone === "RISK_OFF" ? bad : warn;
+  gauge($("g-mood"), sc === null || sc === undefined ? 0 : sc / 100, sc === null || sc === undefined ? "–" : fmt(sc, 1),
+    `${(c.zone || "UNKNOWN").replace("_", "-")} · ${c.components_available || 0} of ${c.components_total || 6} parts measured`, col);
+  const comps = Object.values(m.components || {});
+  $("mood-comps").replaceChildren(...comps.map(x => { const d = el("div", {class: "meter"});
+    meter(d, `${x.label} (${Math.round(x.weight * 100)}%)`, x.data_available ? x.score : 0, 100,
+      !x.data_available ? cssv("--muted") : x.score >= 60 ? good : x.score >= 40 ? warn : bad,
+      x.data_available ? x.signal : "not measured yet: " + x.signal);
+    return d; }));
+  const sol = m.sol || {}, sign = v => v === null || v === undefined ? "–" : (v >= 0 ? "+" : "") + fmt(v, 1) + "%";
+  $("mood-sol").replaceChildren(
+    el("div", {class: "big", text: sol.price ? "$" + fmt(sol.price, 2) : "–"}),
+    el("div", {class: "note", text: `30 days: ${sign(sol.change_30d_pct)} · volatility ${sol.vol30 === null || sol.vol30 === undefined ? "–" : fmt(sol.vol30, 0) + "%/yr"}`}),
+    el("div", {class: "note", text: sol.signal || ""}));
+  const rows = [];
+  for (const t of m.tokens || []) {
+    for (const vs of ["sol", "usd"]) if (t["vs_" + vs]) rows.push({...t["vs_" + vs], watch: t.watch, vs: vs.toUpperCase(), weather: t.weather});
+    if (!t.vs_sol && !t.vs_usd) rows.push({watch: t.watch, vs: "–", note: t.note, weather: t.weather});
+  }
+  const p = v => v === undefined ? "–" : el("span", {class: v >= 90 ? "pos" : v < 70 ? "neg" : "", text: fmt(v, 0) + "%"});
+  const W = {calm: good, choppy: warn, stormy: bad};
+  renderTable("mood-weather", "mood-weather-empty", rows, r => r.note !== undefined && r.in_3d_5 === undefined
+    ? [r.watch, "–", r.note, "", "", "", "", "unknown"]
+    : [r.watch, r.vs, p(r.in_3d_5), p(r.in_3d_20), p(r.in_7d_5), p(r.in_7d_20), `${fmt(r.median_move_7d, 1)}%`,
+       (() => { const b = el("b", {text: r.weather}); b.style.color = W[r.weather] || ""; return b; })()]);
+  const ago = Math.max(0, Date.now() / 1000 - m.t);
+  $("mood-age").textContent = `updated ${ago < 3600 ? Math.round(ago / 60) + " min" : fmt(ago / 3600, 1) + " h"} ago · funding from ${m.funding_source}`
+    + ` · dominance history ${Math.min(m.dominance_days, 31)}/31 days`;
+}
+
 function renderInsights(s) {
   const lp = s.lp || [], good = cssv("--good"), bad = cssv("--critical"), pct = v => (v >= 0 ? "+" : "") + fmt(v, 3) + "%";
   const live = lp.filter(r => r.hours > 0);
@@ -794,6 +847,7 @@ async function refresh() {
   renderWatches(s.watches);
   renderLive(s);
   renderInsights(s);
+  renderMood(s);
   renderAudit(s);
   lastLp = s.lp || [];
   renderLp();

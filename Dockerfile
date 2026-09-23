@@ -1,7 +1,8 @@
 # Orbit Watcher — private dashboard. Standard library only: no pip installs.
 FROM python:3.12-slim
 WORKDIR /app
-COPY watcher.py server.py dashboard.html ./
+COPY watcher.py server.py dashboard.html regime.py ./
+COPY regime_skill ./regime_skill
 ENV PYTHONUNBUFFERED=1 DATA_DIR=/data
 # Runs as root because Railway volumes are root-owned.
 EXPOSE 8080
