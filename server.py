@@ -152,6 +152,7 @@ class App:
         self.first_backoff, self.eval_delay = first_backoff, eval_delay
         self.logs: collections.deque = collections.deque(maxlen=300)
         self.engine: W.Engine | None = None
+        self.auditor: W.Auditor | None = None
         self.task: asyncio.Task | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.recorder: W.Recorder | None = None
@@ -232,6 +233,7 @@ class App:
                     print("Orca pools: adaptive-fee oracles located and saved.", flush=True)
             except Exception as e:
                 print(f"Orca oracle check skipped ({e}).", flush=True)
+            self._http_url = http_url
             await W.run_watch(cfg, self.rpc_factory(http_url), self.recorder, ws_url,
                               first_backoff=self.first_backoff, eval_delay=self.eval_delay,
                               connect=self.connect, on_engine=self._attach)
@@ -252,14 +254,19 @@ class App:
         if not e:
             return
         lat = e.latency_stats()
+        rows = e.lp.summary()
         self.history.append({"t": round(time.time(), 1), "updates": e.updates,
                              "lag": lat["median_slots"] if lat else None,
                              "gaps": {w.label: round(g, 4) for w in e.watches
                                       if (g := e.max_gap_pct(w)) is not None},
                              "net": {w.label: round(g, 4) for w in e.watches
                                      if (g := e.best_net_gap_pct(w)) is not None},
-                             "lp": {f"{r['pool']} ±{r['range_pct']}%": r["net_vs_hold_pct"]
-                                    for r in e.lp.summary()}})
+                             "gaps_seen": e.stats.get("dislocations", 0) + e.open_count(),
+                             "tradable": e.stats.get("tradable", 0),
+                             "shocks": e.stats.get("shocks", 0),
+                             "lp": {f"{r['pool']} ±{r['range_pct']}%": r["net_vs_hold_pct"] for r in rows},
+                             "lp_sol": {f"{r['pool']} ±{r['range_pct']}%": r["net_sol_per_day"] for r in rows},
+                             "loop": {w.label: round(w.loop_best, 6) for w in e.watches if w.loop_best is not None}})
 
     def rates(self) -> dict:
         """Depth-check pass rate and speed of closing, from the full CSV (cached 30 s)."""
@@ -293,6 +300,25 @@ class App:
         print("Pool earnings tracking reset: all paper positions start again from now.", flush=True)
         return True
 
+    def audit_summary(self) -> dict:
+        """Who closed the gaps and how accurate the price maths is (live worker, or the saved CSVs)."""
+        if self.auditor:
+            return self.auditor.summary()
+        return W.summarise_audit(W.read_csv(self.out / "closers.csv"), W.read_csv(self.out / "quote_checks.csv"))
+
+    def loop_state(self) -> dict:
+        e = self.engine
+        live = []
+        if e:
+            for w in e.watches:
+                for (route, sp, up), cur in list(w.loops.items()):
+                    live.append({"watch": w.label, "route": route, "sol_pool": sp, "usdc_pool": up,
+                                 "since": cur["start"], "best_net_sol": round(cur["best"], 6),
+                                 "best_size_sol": round(cur["size"], 4)})
+        return {"open": live, "closed": tail_csv(self.out / "loops.csv", 30),
+                "best_now": {w.label: w.loop_best for w in e.watches if w.loop_best is not None} if e else {},
+                "count": e.stats.get("loops", 0) if e else 0}
+
     def lp_rows(self) -> list[dict]:
         """Pool-earnings rows, each tagged with the watch (token) it belongs to."""
         e = self.engine
@@ -324,9 +350,17 @@ class App:
     def _attach(self, engine) -> None:
         engine.on_event = self.handle_event
         self.engine = engine
+        if self.auditor:
+            self.auditor.close()
+            self.auditor = None
+        if os.environ.get("ORBIT_AUDIT", "1") != "0" and getattr(self, "_http_url", None):
+            self.auditor = W.Auditor(engine, self.rpc_factory(self._http_url), self.out)
+            self.auditor.start()
 
     def handle_event(self, kind: str, data: dict) -> None:
         """Called by the engine: a gap closed or a big shock happened."""
+        if self.auditor:
+            self.auditor.on_event(kind, data)
         if kind == "gap_closed" and data.get("tradable") == "yes":
             best = max(float(data[k]) for k in ("depth_net_sol_0_25", "depth_net_sol_1", "depth_net_sol_2_5"))
             text = (f"Orbit: tradable gap on {data['watch']}\n{data['buy_pool']} -> {data['sell_pool']}\n"
@@ -474,6 +508,8 @@ class App:
             "rpc": "private" if os.environ.get("SOLANA_RPC_HTTP") else "public",
             "latency": e.latency_stats() if e else None,
             "lp": self.lp_rows(),
+            "audit": self.audit_summary(),
+            "loops": self.loop_state(),
             "history": list(self.history)[-720::2], "open_gaps": self.open_gaps(),
             "rates": {k: v for k, v in self.rates().items() if k != "t"},
             "min_net_gap_pct": min((w.min_net_gap * 100 for w in e.watches), default=0.2) if e else 0.2,

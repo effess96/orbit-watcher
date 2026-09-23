@@ -863,7 +863,8 @@ class PoolEarningsTests(unittest.TestCase):
         self.assertAlmostEqual(r["capital_sol"], W.LP_CAPITAL_SOL)
         self.assertAlmostEqual(r["cost_sol"], W.LP_TX_COST_SOL + W.LP_CAPITAL_SOL * 0.003, places=6)
         self.assertAlmostEqual(r["net_sol_per_day"], 0.12 * W.LP_CAPITAL_SOL, places=3)   # 0.5%/h = 12%/day
-        self.assertAlmostEqual(r["days_to_break_even"], round(r["cost_sol"] / r["net_sol_per_day"], 1), places=6)
+        self.assertAlmostEqual(r["days_to_break_even"], round(r["cost_sol"] / r["net_sol_per_day"], 2), places=6)
+        self.assertGreater(r["days_to_break_even"], 0)          # a fast payback is never reported as "never"
 
     def test_losing_position_never_breaks_even(self):
         p = self.pool()
@@ -972,6 +973,249 @@ class PoolEarningsTests(unittest.TestCase):
             text = W.report(Path(d))
             self.assertIn("POOL EARNINGS", text)
             self.assertIn("Orca X", text)
+
+
+def damm2_bytes(mint_a, mint_b, price_raw, liquidity_orca, fee_num=2_500_000, fa=0, fb=0, status=0,
+                vault_a=None, vault_b=None):
+    """A Meteora DAMM v2 pool account laid out as in Meteora's cp-amm source."""
+    b = bytearray(1112)
+    b[8:16] = fee_num.to_bytes(8, "little")
+    b[168:200], b[200:232] = W.b58decode(mint_a), W.b58decode(mint_b)
+    if vault_a:
+        b[232:264], b[264:296] = W.b58decode(vault_a), W.b58decode(vault_b)
+    b[360:376] = (int(liquidity_orca) << 64).to_bytes(16, "little")
+    b[456:472] = int(price_raw ** 0.5 * 2 ** 64).to_bytes(16, "little")
+    b[481] = status
+    b[488:520], b[520:552] = int(fa).to_bytes(32, "little"), int(fb).to_bytes(32, "little")
+    return bytes(b)
+
+
+def fake_tx(slot, signer, deltas, tip=0, cu_price=0, fee=5000, extra_programs=(), err=None):
+    """A jsonParsed transaction: `deltas` maps token account -> (mint, owner, pre, post)."""
+    keys = [signer] + list(deltas)
+    pre, post = [], []
+    for i, (acct, (mint, owner, a, b)) in enumerate(deltas.items(), start=1):
+        pre.append({"accountIndex": i, "mint": mint, "owner": owner, "uiTokenAmount": {"amount": str(a)}})
+        post.append({"accountIndex": i, "mint": mint, "owner": owner, "uiTokenAmount": {"amount": str(b)}})
+    top = [{"programId": p, "accounts": [], "data": ""} for p in extra_programs]
+    if cu_price:
+        top.append({"programId": W.COMPUTE_BUDGET, "data": W.b58encode(bytes([3]) + cu_price.to_bytes(8, "little"))})
+    inner = []
+    if tip:
+        inner.append({"index": 0, "instructions": [{"program": "system", "programId": "11111111111111111111111111111111",
+                      "parsed": {"type": "transfer", "info": {"source": signer, "lamports": tip,
+                                 "destination": sorted(W.JITO_TIP_ACCOUNTS)[0]}}}]})
+    return {"slot": slot, "blockTime": 1_790_000_000,
+            "transaction": {"signatures": ["sig%d" % slot], "message": {
+                "accountKeys": [{"pubkey": k, "signer": i == 0} for i, k in enumerate(keys)], "instructions": top}},
+            "meta": {"err": err, "fee": fee, "computeUnitsConsumed": 120_000, "innerInstructions": inner,
+                     "preTokenBalances": pre, "postTokenBalances": post}}
+
+
+class FakeAuditRpc:
+    def __init__(self, sigs: dict, txs: dict):
+        self.sigs, self.txs, self.calls = sigs, txs, []
+
+    def call(self, method, params):
+        self.calls.append(method)
+        if method == "getSignaturesForAddress":
+            return self.sigs.get(params[0], [])
+        if method == "getTransaction":
+            return self.txs.get(params[0])
+        raise RuntimeError(method)
+
+
+class NewFeatureTests(TempDirCase):
+    """DAMM v2 pools, triangle loops, and reading real transactions (who closed a gap, reality check)."""
+
+    def engine(self, cfg):
+        rec = W.Recorder(self.dir)
+        self.addCleanup(rec.close)
+        return W.Engine(cfg, rec)
+
+    # -- DAMM v2 ---------------------------------------------------------------------------------
+    def test_damm2_prices_both_orientations_and_reads_counters(self):
+        data = damm2_bytes(TOKEN, W.WSOL, 1.0, 10 ** 15, fa=7 << 128, fb=9 << 128)
+        p = W.Pool({"name": "D", "kind": "damm2", "address": "x", "quote_mint": W.WSOL, "quote_decimals": 9,
+                    "token_is_a": True, "fee": 0.0}, 6)
+        price, fee = p.decode_state(data)
+        self.assertAlmostEqual(price, 0.001)
+        self.assertAlmostEqual(fee, 0.0025)
+        x = W.state_extra("damm2", data)
+        self.assertEqual(x["L"], 10 ** 15)                            # rescaled to Orca units
+        self.assertEqual((x["fa"], x["fb"]), (7 << 128, 9 << 128))
+        q = W.Pool({"name": "D2", "kind": "damm2", "address": "x", "quote_mint": W.WSOL, "quote_decimals": 9,
+                    "token_is_a": False, "fee": 0.0}, 6)
+        price2, _ = q.decode_state(damm2_bytes(W.WSOL, TOKEN, 1.0, 10 ** 15))
+        self.assertAlmostEqual(price2, 0.001)
+        self.assertEqual(W.layout_mints("damm2", data), (TOKEN, W.WSOL))
+
+    def test_damm2_swap_maths_matches_orca_for_same_state(self):
+        a = W.Pool({"name": "D", "kind": "damm2", "address": "x", "quote_mint": W.WSOL, "quote_decimals": 9,
+                    "token_is_a": True, "fee": 0.0025}, 6)
+        o = W.Pool({"name": "O", "kind": "whirlpool", "address": "y", "quote_mint": W.WSOL, "quote_decimals": 9,
+                    "token_is_a": True, "fee": 0.0025}, 6)
+        for p in (a, o):
+            p.state_price, p.L, p.sq = 0.001, 10 ** 15, 1.0
+        self.assertTrue(a.can_quote_depth())
+        self.assertAlmostEqual(a.buy_token(0.5), o.buy_token(0.5), places=9)
+        self.assertAlmostEqual(a.sell_token(100.0), o.sell_token(100.0), places=12)
+
+    def test_damm2_pool_feeds_earnings(self):
+        cfg = {"watches": [{"label": "D", "token_mint": TOKEN, "token_decimals": 6, "shock_pct": 0.5,
+                            "pools": [{"name": "Meteora DAMM v2 Dx", "kind": "damm2", "address": POOL_A,
+                                       "quote_mint": W.WSOL, "quote_decimals": 9, "token_is_a": True, "fee": 0.0025},
+                                      {"name": "A", "kind": "cp", "quote_mint": W.WSOL, "quote_decimals": 9,
+                                       "base_vault": VA_T, "quote_vault": VA_Q, "fee": 0.0025}]}]}
+        e = self.engine(cfg)
+        e.on_account(POOL_A, b64acct(damm2_bytes(TOKEN, W.WSOL, 1.0, 10 ** 12)), 10, 0.0)
+        liq = e.lp.sims[f"{POOL_A}|0.05"].liq
+        fb = int(0.3e9 / liq * 2 ** 64)                        # pays the ±5% position 0.3 SOL (0.3%)
+        e.on_account(POOL_A, b64acct(damm2_bytes(TOKEN, W.WSOL, 1.0, 10 ** 12, fb=fb)), 11, 3600.0)
+        rows = {r["range_pct"]: r for r in e.lp.summary()}
+        self.assertEqual(len(rows), len(W.LP_RANGES))
+        self.assertAlmostEqual(rows[5]["fees_pct"], 0.3, places=3)
+        self.assertTrue(0 < rows[20]["fees_pct"] < 0.3)          # wider range, thinner liquidity, less fee
+
+    def test_solfi_and_vertigo_are_reported_not_guessed(self):
+        self.assertIn("SolFi", W.KNOWN_UNSUPPORTED["SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe"])
+        self.assertIn("Vertigo", W.KNOWN_UNSUPPORTED["vrTGoBuy5rYSxAfV3jaRJWHH6nN9WK4NRExGxsk1bCJ"])
+
+    # -- triangle loops ----------------------------------------------------------------------------
+    def loop_engine(self):
+        e = self.engine(mixed_config([USDC_POOL], ref=True))
+        for v, a in ((VA_T, 10 ** 12), (VA_Q, 10 ** 12), (REF_S, 10 ** 12), (REF_U, 150 * 10 ** 9),
+                     (VU_T, 10 ** 12), (VU_Q, 150_000 * 10 ** 6)):
+            e.on_vault(v, a, 100, 1000.0)                   # token = 0.001 SOL = 0.15 USDC everywhere
+        e.on_account(WHIRL, b64acct(whirl_bytes(TOKEN, W.WSOL, 1.0)), 100, 1000.0)
+        return e
+
+    def test_triangle_loop_opens_and_closes(self):
+        e = self.loop_engine()
+        e.evaluate(1000.0)
+        w = e.watches[0]
+        self.assertEqual(w.loops, {})
+        self.assertLess(w.loop_best, 0)                     # fees on three swaps: a small loss at rest
+        e.on_vault(VU_Q, 156_000 * 10 ** 6, 101, 1000.4)    # USDC pool 4% richer
+        e.evaluate(1000.5)
+        self.assertIn(("SOL>token>USDC", "A", "U"), w.loops)
+        self.assertGreater(w.loop_best, 0.01)
+        e.on_vault(VU_Q, 150_000 * 10 ** 6, 103, 1001.2)
+        e.evaluate(1001.3)
+        self.assertEqual(w.loops, {})
+        self.assertEqual(e.stats["loops"], 1)
+        e.rec.loops.fh.flush()
+        row = self.rows("loops.csv")[0]
+        self.assertEqual(row["route"], "SOL>token>USDC")
+        self.assertEqual(int(row["slots_open"]), 2)
+        self.assertGreater(float(row["best_net_sol"]), float(row["net_sol_0_25"]))
+
+    def test_loop_maths_is_three_real_swaps(self):
+        e = self.loop_engine()
+        e.evaluate(1000.0)
+        w = e.watches[0]
+        s, u = w.pools[0], w.pools[2]
+        size = 1.0
+        manual = W.swap_out(W.swap_out(W.swap_out(size, 1000, 10 ** 6, 0.0025) * 1, 10 ** 6, 150_000, 0.0025),
+                            150_000, 1000, 0.0025) - size - w.cost_sol
+        self.assertAlmostEqual(W.Engine.loop_net(w, s, u, "SOL>token>USDC", size), manual, places=9)
+
+    # -- reading transactions -------------------------------------------------------------------------
+    def test_parse_tx_reads_costs_tip_and_token_changes(self):
+        tx = fake_tx(500, "Signer1111", {VA_T: (TOKEN, "amm", 100, 150), VA_Q: (W.WSOL, "amm", 1000, 940)},
+                     tip=100_000, cu_price=50_000, fee=25_000, extra_programs=("ProgX",))
+        t = W.parse_tx(tx)
+        self.assertEqual(t["signer"], "Signer1111")
+        self.assertEqual(t["tip"], 100_000)
+        self.assertEqual(t["priority_fee"], 20_000)
+        self.assertEqual(t["cu_price"], 50_000)
+        self.assertEqual(t["deltas"][VA_T]["delta"], 50)
+        self.assertEqual(t["deltas"][VA_Q]["delta"], -60)
+        self.assertIn("ProgX", t["programs"])
+        self.assertTrue(t["success"])
+
+    def test_pool_state_before_a_slot(self):
+        p = W.Pool({"name": "A", "kind": "cp", "quote_mint": W.WSOL, "quote_decimals": 9,
+                    "base_vault": VA_T, "quote_vault": VA_Q, "fee": 0.0025}, 6)
+        for slot, q in ((10, 100), (12, 200), (15, 300)):
+            p.base, p.quote = 10 ** 9, q * 10 ** 9
+            p.remember(slot)
+        self.assertEqual(p.state_before(15).quote, 200 * 10 ** 9)
+        self.assertEqual(p.state_before(13).quote, 200 * 10 ** 9)
+        self.assertIsNone(p.state_before(10))                  # nothing older than the first snapshot
+        self.assertEqual(p.quote, 300 * 10 ** 9)                # the live pool is untouched
+
+    def test_reality_check_on_a_constant_product_swap(self):
+        e = self.engine(mixed_config())
+        e.on_vault(VA_T, 10 ** 12, 100, 1000.0)
+        e.on_vault(VA_Q, 10 ** 12, 100, 1000.0)
+        w = e.watches[0]
+        p = w.pools[0]
+        sold = 5 * 10 ** 6                                     # someone sells 5 tokens
+        out = int(W.swap_out(5.0, 10 ** 6, 1000.0, 0.0025) * 1e9)
+        tx = fake_tx(105, "Trader", {VA_T: (TOKEN, "amm", 10 ** 12, 10 ** 12 + sold),
+                                      VA_Q: (W.WSOL, "amm", 10 ** 12, 10 ** 12 - out)})
+        rpc = FakeAuditRpc({p.address or VA_T: []}, {"sig105": tx})
+        a = W.Auditor(e, rpc, self.dir, pause=0)
+        self.addCleanup(a.close)
+        flow = W.pool_flow(p, W.parse_tx(tx))
+        res = W.check_swap(p, flow, p.state_before(105))
+        self.assertEqual(res["direction"], "sell token")
+        self.assertLess(abs(res["error_pct"]), 1e-4)
+        self.assertIsNone(W.check_swap(p, {"token": 5, "quote": 5}, p.state_before(105)))   # a deposit, not a swap
+
+    def test_auditor_finds_who_closed_a_gap(self):
+        e = self.engine(mixed_config())
+        w = e.watches[0]
+        a_pool, orca = w.pools[0], w.pools[1]
+        e.on_vault(VA_T, 10 ** 12, 100, 1000.0)
+        e.on_vault(VA_Q, 10 ** 12, 100, 1000.0)
+        e.on_account(WHIRL, b64acct(whirl_bytes(TOKEN, W.WSOL, 1.0)), 100, 1000.0)
+        orca.vault_side = {"OV_T": "token", "OV_Q": "quote"}
+        arb = fake_tx(101, "ArbBot111", {VA_T: (TOKEN, "amm", 100, 90), VA_Q: (W.WSOL, "amm", 100, 110),
+                                          "OV_T": (TOKEN, WHIRL, 50, 60), "OV_Q": (W.WSOL, WHIRL, 60, 49)},
+                      tip=250_000, fee=10_000)
+        rpc = FakeAuditRpc({WHIRL: [{"signature": "sig101", "slot": 101}]}, {"sig101": arb})
+        aud = W.Auditor(e, rpc, self.dir, pause=0)
+        self.addCleanup(aud.close)
+        aud.find_closer({"watch": "TEST", "buy_pool": "A", "sell_pool": "Orca", "open_slot": 100,
+                         "close_slot": 101, "opened_utc": "2026-09-23T00:00:00+00:00"})
+        s = aud.summary()
+        self.assertEqual(s["closers_found"], 1)
+        self.assertEqual(s["by_arbitrage_bots"], 1)
+        self.assertEqual(s["leaders"][0]["signer"], "ArbBot111")
+        self.assertAlmostEqual(s["median_tip_sol"], 0.00025)
+        aud.closers.fh.flush()
+        self.assertEqual(self.rows("closers.csv")[0]["touched_both_pools"], "True")
+
+    def test_auditor_reality_check_job_end_to_end(self):
+        e = self.engine(mixed_config())
+        e.on_vault(VA_T, 10 ** 12, 100, 1000.0)
+        e.on_vault(VA_Q, 10 ** 12, 100, 1000.0)
+        for s_ in range(101, 108):                              # a few more states on record
+            e.on_vault(VA_Q, 10 ** 12, s_, 1000.0 + s_)
+        p = e.watches[0].pools[0]
+        p.address = "POOLA"
+        paid = 2 * 10 ** 9                                      # someone pays 2 SOL for tokens
+        got = int(W.swap_out(2.0, 1000.0, 10 ** 6, 0.0025) * 1e6)
+        tx = fake_tx(110, "Buyer", {VA_T: (TOKEN, "amm", 10 ** 12, 10 ** 12 - got),
+                                     VA_Q: (W.WSOL, "amm", 10 ** 12, 10 ** 12 + paid)})
+        rpc = FakeAuditRpc({"POOLA": [{"signature": "sig110", "slot": 110}]}, {"sig110": tx})
+        aud = W.Auditor(e, rpc, self.dir, pause=0)
+        self.addCleanup(aud.close)
+        e.watches[0].pools[1].history.clear()                   # only the cp pool is eligible
+        aud.check_random_pool()
+        s = aud.summary()
+        self.assertEqual(s["checks"], 1)
+        self.assertLess(s["median_error_pct"], 0.001)
+        self.assertEqual(s["recent_checks"][0]["direction"], "buy token")
+
+    def test_report_lists_the_new_sections(self):
+        e = self.engine(mixed_config())
+        e.rec.close()
+        text = W.report(self.dir)
+        for head in ("TRIANGLE LOOPS", "WHO CLOSED THE GAPS", "PRICE-MATHS REALITY CHECK"):
+            self.assertIn(head, text)
 
 
 if __name__ == "__main__":

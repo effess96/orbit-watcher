@@ -149,6 +149,30 @@ section,.watch{min-width:0}
 
   <div class="two">
     <section>
+      <h2>Your SOL per day, top 6 positions (live)</h2>
+      <div class="chart" id="c-sol"></div>
+      <p class="note">Today's pace applied to your own capital, as it changes. Above zero means the position is paying you more than simply holding.</p>
+    </section>
+    <section>
+      <h2>Market speed (live)</h2>
+      <div class="chart" id="c-rate"></div>
+      <p class="note">Gaps and single-update shocks per hour across all watched tokens. Busy periods are when both liquidity fees and arbitrage chances appear.</p>
+    </section>
+  </div>
+
+  <section>
+    <h2>Position health</h2>
+    <div class="gauges">
+      <div class="gauge"><div class="k">Best SOL per day right now</div><div id="g-sol"></div></div>
+      <div class="gauge"><div class="k">Worst position right now</div><div id="g-worst"></div></div>
+      <div class="gauge"><div class="k">How positions are doing</div>
+        <div class="meter" id="m-pay"></div><div class="meter" id="m-never"></div><div class="meter" id="m-fresh"></div></div>
+    </div>
+    <p class="note">"Pays for itself" counts positions whose pace would cover the cost of opening and closing within a week. "Never dipped" counts positions that have never been behind holding.</p>
+  </section>
+
+  <div class="two">
+    <section>
       <h2>Net vs holding over time: top 6 positions (%)</h2>
       <div class="chart" id="c-lp"></div>
       <p class="note">Above zero: providing liquidity beat holding. Watch for lines that stay up after a big price move, not ones that spike.</p>
@@ -167,6 +191,41 @@ section,.watch{min-width:0}
     <div id="arb-empty" class="empty">No gaps yet.</div>
     <p class="note">"Closed within 1 slot" means a faster bot took it before a home setup could act.</p>
   </section>
+
+  <section>
+    <h2>Who takes the gaps</h2>
+    <div class="gauges">
+      <div class="gauge"><div class="k">Median Jito tip paid by the winner</div><div id="g-tip"></div></div>
+      <div class="gauge"><div class="k">Closing transactions</div>
+        <div class="meter" id="m-found"></div><div class="meter" id="m-arbs"></div><div class="meter" id="m-tipped"></div></div>
+      <div class="gauge"><div class="k">Repeat winners (gaps won)</div><div id="b-winners" class="bars"></div></div>
+    </div>
+    <div class="scroll"><table><thead><tr><th>Looked up (UTC)</th><th>Token</th><th>Winner</th><th>Slots open</th><th>Both pools?</th><th>Jito tip</th><th>Total cost</th><th>Transaction</th></tr></thead>
+      <tbody id="closers"></tbody></table></div>
+    <div id="closers-empty" class="empty">Nothing looked up yet. After each gap closes, Orbit finds the transaction that closed it.</div>
+    <p class="note">For every closed gap, Orbit looks up the real transaction that closed it. "Both pools" means a bot bought on one pool and sold on the other in one transaction: that is your competition. The tip is what it paid Jito to go first.</p>
+  </section>
+
+  <div class="two">
+    <section>
+      <h2>Reality check: Orbit's maths vs real swaps</h2>
+      <div class="gauges">
+        <div class="gauge"><div class="k">Median prediction error</div><div id="g-err"></div></div>
+        <div class="gauge"><div class="k">Accuracy</div><div class="meter" id="m-err01"></div><div class="meter" id="m-err1"></div></div>
+      </div>
+      <div class="chart" id="c-err"></div>
+      <div id="b-errkind" class="bars"></div>
+      <p class="note">Every ~45 s Orbit takes a real swap in a watched pool, re-quotes it from the pool state just before, and compares. Small errors mean the depth checks and earnings can be trusted. Big errors on concentrated pools usually mean a trade crossed a price tick, which Orbit's maths does not model.</p>
+    </section>
+    <section>
+      <h2>Triangle loops: SOL → token → USDC → SOL</h2>
+      <div class="chart" id="c-loop"></div>
+      <div class="scroll"><table><thead><tr><th>Token</th><th>Route</th><th>SOL pool</th><th>USDC pool</th><th>Slots open</th><th>Best net</th></tr></thead>
+        <tbody id="loops"></tbody></table></div>
+      <div id="loops-empty" class="empty">No profitable loop yet.</div>
+      <p class="note">Each loop simulates all three swaps on their own pools (including the SOL/USDC pool's depth and fee) at 1 SOL. Above zero would mean profit after every fee and your cost. Tokens need both a SOL and a USDC pool that Orbit can simulate.</p>
+    </section>
+  </div>
 
   <section>
     <h2>Pool earnings (paper liquidity positions) <button id="lp-reset" class="danger">Reset tracking</button></h2>
@@ -281,7 +340,7 @@ const fmt = (n, d = 4) => n === null || n === undefined || n === "" ? "–" : Nu
 const dur = s => { const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`; };
 
 let watchSig = "";
-const KIND = {cp: "constant product", whirlpool: "Orca Whirlpool", clmm: "Raydium CLMM", dlmm: "Meteora DLMM (fee + 1 bin)"};
+const KIND = {cp: "constant product", whirlpool: "Orca Whirlpool", clmm: "Raydium CLMM", dlmm: "Meteora DLMM (fee + 1 bin)", damm2: "Meteora DAMM v2 (base fee)"};
 const pct = f => fmt(f * 100, 4) + "%";
 const feeText = p => pct(p.fee) + " live" + (p.adaptive_fee ? ` (incl. ${pct(p.adaptive_fee)} volatility)` : "");
 let openWatches = new Set();
@@ -566,8 +625,37 @@ function renderInsights(s) {
     fl.push({label: "  price-move loss", value: r.price_move_pct, color: bad, text: pct(r.price_move_pct)});
   }
   bars($("b-feeloss"), fl, "Waiting for data.");
+  const solNow = live.length ? Math.max(...live.map(r => r.net_sol_per_day || 0)) : 0;
+  const worstNow = live.length ? Math.min(...live.map(r => r.net_vs_hold_pct)) : 0;
+  gauge($("g-sol"), Math.max(0, Math.min(1, solNow / 0.05)), `${solNow >= 0 ? "+" : ""}${fmt(solNow, 5)} SOL`,
+    live.length ? `per day on ${fmt(live[0].capital_sol, 2)} SOL · best of ${live.length}` : "waiting for data",
+    solNow > 0 ? good : cssv("--muted"));
+  gauge($("g-worst"), Math.max(0, Math.min(1, Math.abs(worstNow) / 5)), pct(worstNow),
+    live.length ? "the position doing worst right now" : "waiting for data", worstNow >= 0 ? good : bad);
+  const pays = live.filter(r => r.days_to_break_even !== null && r.days_to_break_even !== undefined && r.days_to_break_even <= 7).length;
+  const never = live.filter(r => (r.worst_net_pct || 0) >= 0).length;
+  meter($("m-pay"), "Pays for itself within a week", pays, live.length, pays ? good : cssv("--warning"), `${pays} of ${live.length} positions`);
+  meter($("m-never"), "Never dipped below holding", never, live.length, never ? good : cssv("--warning"), `${never} of ${live.length} positions`);
+  const fresh = live.filter(r => r.in_range_now).length;
+  meter($("m-fresh"), "Earning fees right now", fresh, live.length, fresh === live.length ? good : cssv("--warning"), `${fresh} of ${live.length} in range`);
   const h = s.history || [], latest = h.length ? (h[h.length - 1].lp || {}) : {};
   const names = Object.keys(latest).sort((a, b) => latest[b] - latest[a]).slice(0, 6);
+  const solNames = Object.keys(h.length ? (h[h.length - 1].lp_sol || {}) : {})
+    .sort((a, b) => (h[h.length - 1].lp_sol[b] - h[h.length - 1].lp_sol[a])).slice(0, 6);
+  lineChart($("c-sol"), solNames.map((n, i) => ({name: n, color: SERIES[i % 8],
+    pts: h.filter(p => p.lp_sol && p.lp_sol[n] !== undefined).map(p => [p.t, p.lp_sol[n]])})),
+    {unit: " SOL", digits: 5, tickDigits: 4, ref: 0, label: "Your SOL per day"});
+  const rate = (key, windowS = 300) => {           // counts per hour over a rolling window, so the line is readable
+    const out = []; let j = 0;
+    for (let i = 0; i < h.length; i++) {
+      while (h[i].t - h[j].t > windowS) j++;
+      const dt = h[i].t - h[j].t;
+      if (dt >= 30) out.push([h[i].t, Math.max(0, ((h[i][key] || 0) - (h[j][key] || 0)) / dt * 3600)]);
+    }
+    return out; };
+  lineChart($("c-rate"), [{name: "Gaps per hour", color: SERIES[0], pts: rate("gaps_seen"), },
+                          {name: "Shocks per hour", color: SERIES[1], pts: rate("shocks")}],
+    {digits: 1, tickDigits: 0, label: "Market speed"});
   lineChart($("c-lp"), names.map((n, i) => ({name: n, color: SERIES[i % 8],
     pts: h.filter(p => p.lp && p.lp[n] !== undefined).map(p => [p.t, p.lp[n]])})), {unit: "%", ref: 0, label: "Net vs holding over time", tickDigits: 3});
   renderTable("arb", "arb-empty", (s.rates && s.rates.by_watch) || [], r => [r.watch, r.gaps,
@@ -599,7 +687,7 @@ function renderLp() {
     `${fmt(r.in_range_pct, 0)}%${r.in_range_now ? "" : " (out now)"}`, pc(r.fees_pct), pc(r.fees_per_day_pct),
     pc(r.price_move_pct), pc(r.net_vs_hold_pct), pc(r.worst_net_pct || 0),
     el("span", {class: (r.net_sol_per_day || 0) >= 0 ? "pos" : "neg", text: `${(r.net_sol_per_day || 0) >= 0 ? "+" : ""}${fmt(r.net_sol_per_day, 5)} SOL`}),
-    r.days_to_break_even ? `${fmt(r.days_to_break_even, 1)} d` : "never at this pace",
+    r.days_to_break_even === null || r.days_to_break_even === undefined ? "never at this pace" : `${fmt(r.days_to_break_even, 2)} d`,
   ].map(c => c instanceof Node ? el("td", {}, c) : el("td", {text: c})));
   const out = [];
   if (group) {
@@ -616,6 +704,43 @@ function renderLp() {
   $("lp").replaceChildren(...out);
   $("lp-empty").style.display = rows.length ? "none" : "block";
   $("lp-empty").textContent = lastLp.length ? "No positions match these filters." : "Waiting for Orca or Raydium CLMM pool updates.";
+}
+
+function renderAudit(s) {
+  const a = s.audit || {}, good = cssv("--good"), bad = cssv("--critical"), muted = cssv("--muted");
+  const short = x => x ? `${x.slice(0, 4)}…${x.slice(-4)}` : "–";
+  const tip = a.median_tip_sol;
+  gauge($("g-tip"), tip ? Math.min(1, tip / 0.001) : 0, tip === null || tip === undefined ? "–" : `${fmt(tip, 6)} SOL`,
+    a.closers_found ? `from ${a.closers_found} winners · max ${fmt(a.max_tip_sol, 6)} SOL` : "waiting for closed gaps", tip ? cssv("--warning") : muted);
+  meter($("m-found"), "Closing transaction found", a.closers_found || 0, a.closers_total || 0, cssv("--s1"), `${a.closers_found || 0} of ${a.closers_total || 0} closed gaps`);
+  meter($("m-arbs"), "Closed by arbitrage bots", a.by_arbitrage_bots || 0, a.closers_found || 0, cssv("--s2"), `${a.by_arbitrage_bots || 0} bought and sold in one transaction`);
+  meter($("m-tipped"), "Paid a Jito tip", a.tipped || 0, a.closers_found || 0, cssv("--s4"), `${a.tipped || 0} of ${a.closers_found || 0}`);
+  bars($("b-winners"), (a.leaders || []).map((l, i) => ({label: short(l.signer), value: l.wins, color: SERIES[i % 8], text: `${l.wins}`})), "No repeat winners yet.");
+  renderTable("closers", "closers-empty", a.recent_closers || [], r => [
+    (r.time_utc || "").replace("T", " ").slice(0, 19), r.watch, short(r.signer),
+    r.close_slot && r.open_slot ? String(r.close_slot - r.open_slot) : "–",
+    r.signature ? (String(r.touched_both_pools) === "true" || String(r.touched_both_pools) === "True" ? "yes (arbitrage)" : "no") : "–",
+    r.signature ? `${fmt(r.jito_tip_sol, 6)} SOL` : "–", r.signature ? `${fmt(r.total_cost_sol, 6)} SOL` : "–",
+    r.signature ? el("a", {href: `https://solscan.io/tx/${r.signature}`, target: "_blank", rel: "noopener", text: short(r.signature)}) : (r.note || "–")]);
+  const e = a.median_error_pct;
+  gauge($("g-err"), e === null || e === undefined ? 0 : Math.min(1, e / 2), e === null || e === undefined ? "–" : `${fmt(e, 4)}%`,
+    a.checks ? `${a.checks} real swaps re-quoted` : "waiting for swaps", e === null || e === undefined ? muted : e <= 0.1 ? good : e <= 1 ? cssv("--warning") : bad);
+  meter($("m-err01"), "Within 0.1%", a.within_0_1_pct || 0, a.checks || 0, good, `${a.within_0_1_pct || 0} of ${a.checks || 0}`);
+  meter($("m-err1"), "Within 1%", a.within_1_pct || 0, a.checks || 0, cssv("--s1"), `${a.within_1_pct || 0} of ${a.checks || 0}`);
+  const pts = (a.recent_checks || []).map(c => [Date.parse(c.time_utc) / 1000, Number(c.error_pct)]).filter(p => isFinite(p[0]) && isFinite(p[1]));
+  lineChart($("c-err"), [{name: "Prediction error per swap", color: SERIES[0], pts}], {unit: "%", digits: 4, tickDigits: 3, ref: 0, label: "Prediction error"});
+  bars($("b-errkind"), Object.entries(a.error_by_kind || {}).map(([k, v]) => ({label: `${KIND[k] || k} (${v.n})`, value: v.median_error_pct,
+    color: v.median_error_pct <= 0.1 ? good : v.median_error_pct <= 1 ? cssv("--warning") : bad, text: `${fmt(v.median_error_pct, 4)}%`})), "");
+  const L = s.loops || {}, h = s.history || [];
+  const labels = [...new Set(h.flatMap(p => Object.keys(p.loop || {})))];
+  lineChart($("c-loop"), labels.map((l, i) => ({name: l, color: SERIES[i % 8], pts: h.filter(p => p.loop && p.loop[l] !== undefined).map(p => [p.t, p.loop[l]])})),
+    {unit: " SOL", digits: 5, tickDigits: 4, ref: 0, label: "Best loop at 1 SOL"});
+  const now = Date.now() / 1000;
+  const open = (L.open || []).map(r => [r.watch, r.route, r.sol_pool, r.usdc_pool, `open ${Math.round(now - r.since)} s`,
+    el("span", {class: "pos", text: `+${fmt(r.best_net_sol, 6)} SOL`})]);
+  const closed = (L.closed || []).map(r => [r.watch, r.route, r.sol_pool, r.usdc_pool, r.slots_open,
+    el("span", {class: Number(r.best_net_sol) >= 0 ? "pos" : "neg", text: `${fmt(r.best_net_sol, 6)} SOL`})]);
+  renderTable("loops", "loops-empty", [...open, ...closed], r => r);
 }
 
 async function refresh() {
@@ -646,6 +771,7 @@ async function refresh() {
   renderWatches(s.watches);
   renderLive(s);
   renderInsights(s);
+  renderAudit(s);
   lastLp = s.lp || [];
   renderLp();
   renderTable("gaps", "gaps-empty", s.dislocations, r => [r.opened_utc.replace("T", " ").slice(0, 19), r.watch,

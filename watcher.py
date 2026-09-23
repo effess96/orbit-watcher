@@ -26,13 +26,16 @@ import argparse
 import asyncio
 import base64
 import collections
+import copy
 import csv
 import hashlib
 import json
 import math
 import os
+import random
 import ssl
 import statistics
+import threading
 import struct
 import sys
 import time
@@ -59,6 +62,8 @@ DEFAULT_MIN_PROFIT_SOL = 0.0005  # exact pairs: minimum net profit after cost
 DEFAULT_MIN_NET_GAP_PCT = 0.2    # other pairs: minimum price gap after all fees
 DEFAULT_BIG_SHOCK_PCT = 3.0      # a single-update move this large is an ANB-type event
 DEPTH_SIZES_SOL = (0.25, 1.0, 2.5)  # trade sizes simulated for the depth check (2.5 SOL ~ $300)
+DEPTH_MIN_SOL = 0.01                # smallest and largest sizes the best-size search considers
+DEPTH_MAX_SOL = float(os.environ.get("ORBIT_MAX_TRADE_SOL", 2.5))
 
 # Constant-product pools: price = quote reserve / token reserve (read from vaults).
 # Value: (display name, default fee). Check the real fee of each pool.
@@ -73,12 +78,17 @@ CL_PROGRAMS = {
     "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc": ("Orca Whirlpool", "whirlpool"),
     "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK": ("Raydium CLMM", "clmm"),
     "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo": ("Meteora DLMM", "dlmm"),
+    "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG": ("Meteora DAMM v2", "damm2"),
 }
-KINDS = {"cp", "whirlpool", "clmm", "dlmm"}
+KINDS = {"cp", "whirlpool", "clmm", "dlmm", "damm2"}
+CONCENTRATED = ("whirlpool", "clmm", "damm2")   # single sqrt-price curve: depth and earnings can be simulated
 # Still unsupported (shared vaults / other pricing).
 KNOWN_UNSUPPORTED = {
-    "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG": "Meteora DAMM v2",
     "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB": "Meteora DAMM v1",
+    # These price trades with private logic or oracles, not from what is stored in the pool account,
+    # so reading their vaults would show gaps that do not exist.
+    "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe": "SolFi (price set by private logic, not readable)",
+    "vrTGoBuy5rYSxAfV3jaRJWHH6nN9WK4NRExGxsk1bCJ": "Vertigo (price curve not published, not readable)",
 }
 # Fallback SOL/USDC reference pool (Raydium AMM v4), used for SOL<->USDC comparisons.
 SOL_USDC_FALLBACK = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
@@ -95,7 +105,16 @@ def _u(data: bytes, off: int, size: int, signed: bool = False) -> int:
 
 
 # (mint A offset, mint B offset) per kind; A/B = Whirlpool a/b, CLMM 0/1, DLMM x/y
-MINT_OFFSETS = {"whirlpool": (101, 181), "clmm": (73, 105), "dlmm": (88, 120)}
+MINT_OFFSETS = {"whirlpool": (101, 181), "clmm": (73, 105), "dlmm": (88, 120), "damm2": (168, 200)}
+
+# Meteora DAMM v2 (cp-amm) Pool, from Meteora's source (programs/cp-amm/src/state/pool.rs, 8-byte discriminator):
+# pool_fees 8..168 (base fee cliff numerator u64 at 8, denominator 1e9), mints 168/200, vaults 232/264,
+# liquidity u128 at 360 (scaled by 2^64 relative to Orca), sqrt_min/max/price u128 at 424/440/456 (Q64.64),
+# pool_status u8 at 481, fee_a/b_per_liquidity U256 at 488/520 (scaled by 2^128).
+# Where each concentrated pool keeps its two token vaults (token A / B), to recognise its swaps in transactions.
+VAULT_OFFSETS = {"whirlpool": (133, 213), "clmm": (137, 169), "damm2": (232, 264)}
+DAMM2 = {"fee": 8, "liquidity": 360, "sqrt_min": 424, "sqrt_max": 440, "sqrt": 456, "status": 481,
+         "fee_a": 488, "fee_b": 520}
 
 
 def layout_mints(kind: str, data: bytes) -> tuple[str, str]:
@@ -123,6 +142,8 @@ def raw_price_ab(kind: str, data: bytes) -> float:
         return (_u(data, 65, 16) / 2 ** 64) ** 2
     if kind == "clmm":
         return (_u(data, 253, 16) / 2 ** 64) ** 2
+    if kind == "damm2":
+        return (_u(data, DAMM2["sqrt"], 16) / 2 ** 64) ** 2
     if kind == "dlmm":
         return (1 + _u(data, 80, 2) / 10_000) ** _u(data, 76, 4, signed=True)
     raise ValueError(kind)
@@ -131,6 +152,10 @@ def raw_price_ab(kind: str, data: bytes) -> float:
 def live_fee(kind: str, data: bytes) -> float | None:
     if kind == "whirlpool":
         return _u(data, 45, 2) / 1_000_000   # hundredths of a basis point
+    if kind == "damm2":
+        # Base (cliff) fee: an upper bound, since schedules only lower it over time. Overstating the fee can
+        # hide a gap but never invent one.
+        return min(_u(data, DAMM2["fee"], 8) / 1_000_000_000, 0.5)
     if kind == "dlmm":
         # Swap fee plus one bin width: DLMM prices move in bins, and the active bin may have
         # run out of the token you want to buy, so the real price can be one bin away.
@@ -177,11 +202,18 @@ def adaptive_fee_rate(data: bytes) -> float:
 
 
 # Cumulative LP fees per unit of liquidity (Q64.64, token A/0 then B/1): Whirlpool, Raydium CLMM
-FEE_GROWTH_OFFSETS = {"whirlpool": (165, 245), "clmm": (277, 293)}
+FEE_GROWTH_OFFSETS = {"whirlpool": (165, 245), "clmm": (277, 293), "damm2": (DAMM2["fee_a"], DAMM2["fee_b"])}
 
 
 def state_extra(kind: str, data: bytes) -> dict:
     """Liquidity, exact sqrt price and fee growth (Whirlpool/CLMM) or bin width (DLMM)."""
+    if kind == "damm2":
+        # Rescale to Orca units so the same swap and earnings maths apply: liquidity / 2^64, and fee per
+        # liquidity (2^128-scaled) times liquidity (2^64-scaled) works out to the Q64.64 counter the sim expects.
+        out = {"L": _u(data, DAMM2["liquidity"], 16) >> 64, "sq": _u(data, DAMM2["sqrt"], 16) / 2 ** 64}
+        if len(data) >= DAMM2["fee_b"] + 32:
+            out["fa"], out["fb"] = _u(data, DAMM2["fee_a"], 32), _u(data, DAMM2["fee_b"], 32)
+        return out
     if kind in FEE_GROWTH_OFFSETS:
         l_off, s_off = (49, 65) if kind == "whirlpool" else (237, 253)
         fa, fb = FEE_GROWTH_OFFSETS[kind]
@@ -232,6 +264,19 @@ def swap_out(amount_in: float, reserve_in: float, reserve_out: float, fee: float
     return reserve_out * a / (reserve_in + a)
 
 
+def best_trade_size(net_at, low: float = DEPTH_MIN_SOL, high: float = DEPTH_MAX_SOL,
+                    rounds: int = 24) -> tuple[float, float]:
+    """The trade size that nets the most SOL, by narrowing the range (profit rises then falls with size)."""
+    for _ in range(rounds):
+        a, b = low + (high - low) / 3, high - (high - low) / 3
+        if net_at(a) < net_at(b):
+            low = a
+        else:
+            high = b
+    size = (low + high) / 2
+    return round(size, 6), net_at(size)
+
+
 def best_round_trip(cheap: tuple, rich: tuple) -> tuple[float, float]:
     """
     Buy the token on the cheap pool with quote currency, sell it on the rich pool.
@@ -263,9 +308,11 @@ def best_round_trip(cheap: tuple, rich: tuple) -> tuple[float, float]:
 DISLOCATION_FIELDS = ["opened_utc", "watch", "buy_pool", "sell_pool", "method", "open_slot", "close_slot",
                       "slots_open", "seconds_open", "peak_gap_pct", "peak_net_gap_pct", "peak_net_quote",
                       "best_size_quote", "quote", "depth_net_sol_0_25", "depth_net_sol_1",
-                      "depth_net_sol_2_5", "tradable"]
+                      "depth_net_sol_2_5", "depth_best_size_sol", "depth_best_net_sol", "tradable"]
 SHOCK_FIELDS = ["time_utc", "slot", "watch", "pool", "move_pct", "best_net_gap_pct_visible",
                 "best_net_quote_visible", "profitable_gap_visible", "quote"]
+LOOP_FIELDS = ["opened_utc", "watch", "route", "sol_pool", "usdc_pool", "open_slot", "close_slot", "slots_open",
+               "seconds_open", "net_sol_0_25", "net_sol_1", "net_sol_2_5", "best_size_sol", "best_net_sol"]
 
 
 # Column layouts written by earlier versions, so mixed files can be repaired.
@@ -330,6 +377,7 @@ class Recorder:
         self.folder = folder
         self.dislocations = CsvFile(folder / "dislocations.csv", DISLOCATION_FIELDS)
         self.shocks = CsvFile(folder / "shocks.csv", SHOCK_FIELDS)
+        self.loops = CsvFile(folder / "loops.csv", LOOP_FIELDS)
         self.raw_fh = open(folder / "raw_updates.jsonl", "a", encoding="utf-8") if keep_raw else None
         self._raw_count = 0
         self._last_flush = 0.0
@@ -364,6 +412,7 @@ class Recorder:
     def close(self) -> None:
         self.dislocations.close()
         self.shocks.close()
+        self.loops.close()
         if self.raw_fh:
             self.raw_fh.close()
 
@@ -407,6 +456,10 @@ class Pool:
         self.sq: float | None = None     # sqrt(raw price of A in B)
         self.bin_step: float | None = None  # DLMM bin width as a fraction
         self.fg: tuple[int, int] | None = None  # fee growth per liquidity (A, B), Q64.64
+        self.history: collections.deque = collections.deque(maxlen=400)   # (slot, state) for the reality check
+        self.vault_side: dict[str, str] = {}    # vault address -> "token" or "quote" (for reading real swaps)
+        if self.kind == "cp":
+            self.vault_side = {self.base_vault: "token", self.quote_vault: "quote"}
 
     def accounts(self) -> list[tuple[str, str, str]]:
         """(address, role, RPC encoding) for every account to subscribe to."""
@@ -422,6 +475,29 @@ class Pool:
             return bool(self.base) and bool(self.quote)
         return bool(self.state_price) and self.state_price > 0
 
+    def remember(self, slot: int) -> None:
+        """Keep the state as of `slot`, so a real swap can later be re-quoted from the state just before it."""
+        snap = {"base": self.base, "quote": self.quote, "fee": self.fee, "L": self.L, "sq": self.sq,
+                "state_price": self.state_price}
+        if self.history and self.history[-1][0] == slot:
+            self.history[-1] = (slot, snap)
+        else:
+            self.history.append((slot, snap))
+
+    def state_before(self, slot: int) -> "Pool | None":
+        """A copy of this pool as it was just before `slot` (None if that is older than what we kept)."""
+        prev = None
+        for s_, snap in self.history:
+            if s_ >= slot:
+                break
+            prev = snap
+        if prev is None or (self.history and self.history[0][0] >= slot):
+            return None
+        twin = copy.copy(self)
+        for k, v in prev.items():
+            setattr(twin, k, v)
+        return twin if twin.ready() and (twin.kind == "cp" or twin.can_quote_depth()) else None
+
     def reserves(self) -> tuple[float, float, float]:
         return self.base / 10 ** self.tdec, self.quote / 10 ** self.qdec, self.fee
 
@@ -435,7 +511,7 @@ class Pool:
     def can_quote_depth(self) -> bool:
         if self.kind == "cp":
             return self.ready()
-        return self.kind in ("whirlpool", "clmm") and bool(self.L) and bool(self.sq)
+        return self.kind in CONCENTRATED and bool(self.L) and bool(self.sq)
 
     def buy_token(self, q: float) -> float:
         """Tokens received for q (human units of quote), including the fee."""
@@ -494,6 +570,8 @@ class Watch:
         if self.ref is None and len({p.quote_mint for p in self.pools}) > 1:
             raise ValueError(f"Watch {self.label!r} mixes SOL and USDC pools but has no sol_usdc reference.")
         self.open: dict[tuple, dict] = {}
+        self.loops: dict[tuple, dict] = {}      # open triangle loops (SOL -> token -> USDC -> SOL and back)
+        self.loop_best: float | None = None     # best loop result at 1 SOL right now, net SOL
 
     def settings(self) -> dict:
         return {"cost_sol": self.cost_sol, "min_profit_sol": self.min_profit_sol,
@@ -603,7 +681,7 @@ class LpSim:
         per_day = net * 24 / hours                       # net vs holding, at today's pace, in % per day
         sol_day = per_day / 100 * LP_CAPITAL_SOL
         cost = self.cost_sol()
-        days = round(cost / sol_day, 1) if sol_day > 1e-12 else None
+        days = max(round(cost / sol_day, 2), 0.01) if sol_day > 1e-12 else None
         return {"range_pct": round(self.width * 100), "hours": round(hours, 2),
                 "in_range_pct": round(100 * self.in_range_s / (hours * 3600), 1),
                 "fees_pct": round(pct(fees), 4), "fees_per_day_pct": round(pct(fees) * 24 / hours, 4),
@@ -710,7 +788,7 @@ class Engine:
         self.updates = 0
         self.dirty: set[int] = set()
         self.stats = {"shocks": 0, "shock_gaps": 0, "dislocations": 0, "interrupted": 0,
-                      "tradable": 0, "big_shocks": 0, "bin_steps": 0}
+                      "tradable": 0, "big_shocks": 0, "bin_steps": 0, "loops": 0}
         self.warned: set[str] = set()
         self.on_event = None                   # callback(kind, data) for alerts
         self.tip_slot = 0                      # newest slot the RPC has announced
@@ -756,6 +834,8 @@ class Engine:
             setter(p, role)
             p.slots[role] = slot
             self.dirty.add(id(w))
+            if role != "oracle":
+                p.remember(slot)
         self.last_slot = max(self.last_slot, slot)
         self.updates += 1
         return True
@@ -821,6 +901,12 @@ class Engine:
             pool = entries[0][1]
             price, fee = pool.decode_state(data)
             extra = state_extra(pool.kind, data)
+            if not pool.vault_side and pool.kind in VAULT_OFFSETS:
+                va, vb = VAULT_OFFSETS[pool.kind]
+                a, b = b58encode(data[va:va + 32]), b58encode(data[vb:vb + 32])
+                sides = {a: "token", b: "quote"} if pool.token_is_a else {a: "quote", b: "token"}
+                for _, p_, _r in entries:
+                    p_.vault_side = sides
         except (KeyError, TypeError, ValueError, IndexError, OverflowError, ZeroDivisionError):
             return
         self.on_state(addr, price, fee, slot, t, extra=extra)
@@ -845,8 +931,9 @@ class Engine:
     def interrupt(self) -> None:
         """Connection lost: open gaps can no longer be timed honestly, so drop them."""
         for w in self.watches:
-            self.stats["interrupted"] += len(w.open)
+            self.stats["interrupted"] += len(w.open) + len(w.loops)
             w.open.clear()
+            w.loops.clear()
 
     def _check_suspects(self, w: Watch, pools: list, sol: dict) -> None:
         """A concentrated pool >50% away from the rest almost certainly means a decoding problem."""
@@ -873,14 +960,21 @@ class Engine:
             else:
                 return None
         ref_fee = w.ref.fee if cross and w.ref else 0.0
+
+        def net_at(size: float) -> float:
+            """Net SOL of a full round trip of this size, after both pool fees and your cost."""
+            tokens = cheap.buy_token(size * conv[id(cheap)])
+            sol_back = rich.sell_token(tokens) / conv[id(rich)] * (1 - ref_fee)
+            return sol_back - size - w.cost_sol
+
         out = {}
         try:
             for size in DEPTH_SIZES_SOL:
-                tokens = cheap.buy_token(size * conv[id(cheap)])
-                sol_back = rich.sell_token(tokens) / conv[id(rich)] * (1 - ref_fee)
-                out[size] = sol_back - size - w.cost_sol
+                out[size] = net_at(size)
+            best_size, best_net = best_trade_size(net_at)
         except (ZeroDivisionError, OverflowError, ValueError):
             return None
+        out["best_size"], out["best"] = best_size, best_net
         return out
 
     def _evaluate_watch(self, w: Watch, t: float) -> None:
@@ -918,6 +1012,8 @@ class Engine:
                 depth = self._depth(w, cheap, rich, cross) if ok else None
                 self._track(w, (a.name, b.name), cheap, rich, gap, net_gap, method, size, net, ok, quote, t, depth)
 
+        self._evaluate_loops(w, ready, t)
+
         for p in ready:
             price = p.price()  # own quote, so SOL/USD moves don't count as shocks
             if p.last_price:
@@ -941,9 +1037,63 @@ class Engine:
                         "profitable_gap_visible": "yes" if visible else "no", "quote": p.quote_sym})
             p.last_price = price
 
+    # -- triangle loops ---------------------------------------------------------------------------------
+    @staticmethod
+    def loop_net(w: "Watch", s: "Pool", u: "Pool", route: str, size: float) -> float:
+        """Net SOL of a full three-swap loop of `size` SOL, every leg simulated on its pool, after your cost.
+
+        "SOL>token>USDC": buy the token with SOL on s, sell it for USDC on u, buy SOL with that USDC on the
+        SOL/USDC reference pool.  "SOL>USDC>token": the reverse direction.
+        """
+        if route == "SOL>token>USDC":
+            back = w.ref.buy_token(u.sell_token(s.buy_token(size)))
+        else:
+            back = s.sell_token(u.buy_token(w.ref.sell_token(size)))
+        return back - size - w.cost_sol
+
+    def _evaluate_loops(self, w: "Watch", ready: list, t: float) -> None:
+        if not (w.ref and w.ref.ready() and w.ref.can_quote_depth()):
+            return
+        sols = [p for p in ready if p.quote_mint == WSOL and p.can_quote_depth()]
+        usdcs = [p for p in ready if p.quote_mint != WSOL and p.can_quote_depth()]
+        best_now = None
+        for s in sols:
+            for u in usdcs:
+                for route in ("SOL>token>USDC", "SOL>USDC>token"):
+                    key = (route, s.name, u.name)
+                    try:
+                        at1 = self.loop_net(w, s, u, route, 1.0)
+                        best_now = at1 if best_now is None else max(best_now, at1)
+                        profitable = at1 >= w.min_profit_sol or self.loop_net(w, s, u, route, DEPTH_SIZES_SOL[0]) >= w.min_profit_sol
+                        if profitable:
+                            size, best = best_trade_size(lambda x: self.loop_net(w, s, u, route, x))
+                            profitable = best >= w.min_profit_sol
+                    except (ZeroDivisionError, ValueError, OverflowError, TypeError):
+                        continue
+                    cur = w.loops.get(key)
+                    if profitable:
+                        nets = {x: self.loop_net(w, s, u, route, x) for x in DEPTH_SIZES_SOL}
+                        if cur is None:
+                            w.loops[key] = dict(start=t, start_slot=self.last_slot, nets=nets, size=size, best=best)
+                        elif best > cur["best"]:
+                            cur.update(nets=nets, size=size, best=best)
+                    elif cur is not None:
+                        self.stats["loops"] += 1
+                        row = {"opened_utc": now_iso(cur["start"]), "watch": w.label, "route": route,
+                               "sol_pool": s.name, "usdc_pool": u.name, "open_slot": cur["start_slot"],
+                               "close_slot": self.last_slot, "slots_open": self.last_slot - cur["start_slot"],
+                               "seconds_open": round(t - cur["start"], 3),
+                               "net_sol_0_25": round(cur["nets"][0.25], 6), "net_sol_1": round(cur["nets"][1.0], 6),
+                               "net_sol_2_5": round(cur["nets"][2.5], 6), "best_size_sol": round(cur["size"], 4),
+                               "best_net_sol": round(cur["best"], 6)}
+                        self.rec.loops.write(row)
+                        self._emit("loop_closed", row)
+                        del w.loops[key]
+        w.loop_best = best_now
+
     def _track(self, w, key, cheap, rich, gap, net_gap, method, size, net, ok, quote, t, depth=None) -> None:
         cur = w.open.get(key)
-        best = max(depth.values()) if depth else None
+        best = depth.get("best") if depth else None
         if ok:
             if cur is None:
                 w.open[key] = dict(start=t, start_slot=self.last_slot, buy=cheap.name, sell=rich.name,
@@ -975,6 +1125,8 @@ class Engine:
                 "depth_net_sol_0_25": round(d[0.25], 6) if d else "",
                 "depth_net_sol_1": round(d[1.0], 6) if d else "",
                 "depth_net_sol_2_5": round(d[2.5], 6) if d else "",
+                "depth_best_size_sol": round(d["best_size"], 4) if d else "",
+                "depth_best_net_sol": round(d["best"], 6) if d else "",
                 "tradable": tradable}
             self.rec.dislocations.write(row)
             self._emit("gap_closed", row)
@@ -1209,6 +1361,286 @@ class WebSocket:
 
 
 # ---------------------------------------------------------------------------
+# Reading real transactions: who closed a gap, and how well Orbit's maths predicts real swaps
+# ---------------------------------------------------------------------------
+# Jito's eight public tip accounts: a transfer to one of these is a tip for priority inclusion.
+JITO_TIP_ACCOUNTS = {
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5", "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY", "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh", "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL", "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+}
+COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111"
+BASE_FEE_LAMPORTS = 5000
+CLOSER_FIELDS = ["time_utc", "watch", "gap_opened_utc", "open_slot", "close_slot", "tx_slot", "signature", "signer",
+                 "success", "touched_both_pools", "jito_tip_sol", "priority_fee_sol", "total_cost_sol",
+                 "compute_units", "programs", "note"]
+CHECK_FIELDS = ["time_utc", "watch", "pool", "kind", "tx_slot", "signature", "direction", "amount_in",
+                "actual_out", "predicted_out", "error_pct", "trade_share_of_pool_pct", "note"]
+
+
+def parse_tx(tx: dict) -> dict | None:
+    """Summarise one jsonParsed transaction: signer, costs, tip, programs, and every token-account change."""
+    if not tx or "transaction" not in tx:
+        return None
+    msg, meta = tx["transaction"]["message"], tx.get("meta") or {}
+    keys = [k["pubkey"] if isinstance(k, dict) else k for k in msg.get("accountKeys", [])]
+    loaded = meta.get("loadedAddresses") or {}
+    extra = (loaded.get("writable") or []) + (loaded.get("readonly") or [])
+    if extra and not any(k in keys for k in extra):
+        keys = keys + extra
+    sigs = tx["transaction"].get("signatures") or [""]
+    instructions = list(msg.get("instructions", []))
+    for inner in meta.get("innerInstructions") or []:
+        instructions += inner.get("instructions", [])
+    tip, cu_price, programs = 0, 0, set()
+    for ins in instructions:
+        prog = ins.get("programId") or (keys[ins["programIdIndex"]] if "programIdIndex" in ins else "")
+        programs.add(prog)
+        parsed = ins.get("parsed")
+        if isinstance(parsed, dict) and parsed.get("type") == "transfer":
+            info = parsed.get("info", {})
+            if info.get("destination") in JITO_TIP_ACCOUNTS:
+                tip += int(info.get("lamports", 0))
+        if prog == COMPUTE_BUDGET and ins.get("data"):
+            try:
+                raw = b58decode(ins["data"])
+                if raw and raw[0] == 3 and len(raw) >= 9:
+                    cu_price = int.from_bytes(raw[1:9], "little")
+            except ValueError:
+                pass
+    changes: dict[str, dict] = {}
+    for when, rows in (("pre", meta.get("preTokenBalances") or []), ("post", meta.get("postTokenBalances") or [])):
+        for b in rows:
+            idx = b.get("accountIndex")
+            if idx is None or idx >= len(keys):
+                continue
+            c = changes.setdefault(keys[idx], {"mint": b.get("mint"), "owner": b.get("owner"), "pre": 0, "post": 0})
+            c[when] = int((b.get("uiTokenAmount") or {}).get("amount", 0))
+    fee = int(meta.get("fee") or 0)
+    return {"signature": sigs[0], "slot": tx.get("slot"), "block_time": tx.get("blockTime"),
+            "signer": keys[0] if keys else "", "success": meta.get("err") is None, "fee": fee,
+            "priority_fee": max(0, fee - BASE_FEE_LAMPORTS * len(sigs)), "tip": tip, "cu_price": cu_price,
+            "compute_units": meta.get("computeUnitsConsumed"),
+            "programs": sorted(p for p in programs if p and p != COMPUTE_BUDGET),
+            "deltas": {k: {"mint": v["mint"], "owner": v["owner"], "delta": v["post"] - v["pre"]}
+                       for k, v in changes.items() if v["post"] != v["pre"]}}
+
+
+def pool_flow(pool: "Pool", summary: dict) -> dict | None:
+    """How much of the pool's token and quote went in (+) or out (-) in this transaction, in raw units."""
+    flow = {"token": 0, "quote": 0}
+    hit = False
+    for acct, d in summary["deltas"].items():
+        side = pool.vault_side.get(acct)
+        if side is None and pool.kind == "dlmm" and d.get("owner") == pool.address:
+            side = "quote" if d.get("mint") == pool.quote_mint else "token"
+        if side:
+            flow[side] += d["delta"]
+            hit = True
+    return flow if hit else None
+
+
+def check_swap(pool: "Pool", flow: dict, before: "Pool") -> dict | None:
+    """Re-quote a real swap from the pool state just before it; compare with what actually came out."""
+    t_raw, q_raw = flow["token"], flow["quote"]
+    if t_raw == 0 or q_raw == 0 or (t_raw > 0) == (q_raw > 0):
+        return None                               # not a simple one-direction swap (deposit, withdrawal...)
+    tdiv, qdiv = 10 ** pool.tdec, 10 ** pool.qdec
+    if t_raw > 0:                                 # someone sold tokens into the pool, took quote out
+        amount_in, actual = t_raw / tdiv, -q_raw / qdiv
+        predicted, direction = before.sell_token(amount_in), "sell token"
+        share = t_raw / max(1, before.base or 0) * 100 if before.kind == "cp" and before.base else None
+    else:                                         # someone paid quote, took tokens out
+        amount_in, actual = q_raw / qdiv, -t_raw / tdiv
+        predicted, direction = before.buy_token(amount_in), "buy token"
+        share = q_raw / max(1, before.quote or 0) * 100 if before.kind == "cp" and before.quote else None
+    if actual <= 0 or not math.isfinite(predicted):
+        return None
+    return {"direction": direction, "amount_in": amount_in, "actual_out": actual, "predicted_out": predicted,
+            "error_pct": (predicted - actual) / actual * 100, "share": share}
+
+
+class Auditor:
+    """Background worker: looks up real transactions, gently (one RPC call per `pause` seconds).
+
+    Two jobs: for every closed gap, find the transaction that closed it (who, tip, cost); and every so often,
+    re-quote a recent real swap in a watched pool to measure how accurate Orbit's price maths is.
+    """
+
+    def __init__(self, engine: "Engine", rpc, folder: Path, pause: float = 0.7, check_every: float = 45.0,
+                 max_queue: int = 200):
+        self.engine, self.rpc, self.pause, self.check_every = engine, rpc, pause, check_every
+        self.closers = CsvFile(folder / "closers.csv", CLOSER_FIELDS)
+        self.checks = CsvFile(folder / "quote_checks.csv", CHECK_FIELDS)
+        self.jobs: collections.deque = collections.deque(maxlen=max_queue)
+        self.stop = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.seen: set[str] = set()
+        self.stats = {"closers": 0, "closer_misses": 0, "checks": 0, "check_skips": 0, "errors": 0}
+        self.recent_closers: collections.deque = collections.deque(maxlen=300)
+        self.recent_checks: collections.deque = collections.deque(maxlen=500)
+        self._last_check = 0.0
+
+    # -- scheduling --------------------------------------------------------------------------------
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, name="orbit-auditor", daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.stop.set()
+        self.closers.close()
+        self.checks.close()
+
+    def on_event(self, kind: str, data: dict) -> None:
+        if kind == "gap_closed":
+            self.jobs.append(("closer", data))
+
+    def _run(self) -> None:
+        while not self.stop.is_set():
+            try:
+                if self.jobs:
+                    kind, data = self.jobs.popleft()
+                    self.find_closer(data)
+                elif time.time() - self._last_check >= self.check_every:
+                    self._last_check = time.time()
+                    self.check_random_pool()
+                else:
+                    self.stop.wait(1.0)
+            except Exception as e:           # a bad RPC answer must never stop the watcher
+                self.stats["errors"] += 1
+                print(f"Auditor: {e}", flush=True)
+                self.stop.wait(5.0)
+
+    def _call(self, method: str, params: list):
+        self.stop.wait(self.pause)
+        return self.rpc.call(method, params)
+
+    def _tx(self, sig: str) -> dict | None:
+        tx = self._call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0,
+                                                 "commitment": "confirmed"}])
+        return parse_tx(tx)
+
+    def _sigs(self, addr: str, limit: int) -> list[dict]:
+        return self._call("getSignaturesForAddress", [addr, {"limit": limit, "commitment": "confirmed"}]) or []
+
+    def _watch_pools(self, label: str, names: tuple) -> tuple["Watch | None", list]:
+        for w in self.engine.watches:
+            if w.label == label:
+                return w, [p for p in w.pools if p.name in names]
+        return None, []
+
+    # -- job 1: who took it --------------------------------------------------------------------------
+    def find_closer(self, row: dict) -> None:
+        w, pools = self._watch_pools(row["watch"], (row["buy_pool"], row["sell_pool"]))
+        if len(pools) < 2:
+            return
+        lo, hi = int(row["open_slot"]), int(row["close_slot"])
+        candidates = {}
+        for p in pools:
+            for sg in self._sigs(p.address, 25):
+                if lo <= sg.get("slot", 0) <= hi + 1 and not sg.get("err"):
+                    candidates[sg["signature"]] = sg["slot"]
+        best = None
+        for sig, slot in sorted(candidates.items(), key=lambda kv: kv[1])[:6]:
+            summ = self._tx(sig)
+            if not summ:
+                continue
+            touched = [p for p in pools if pool_flow(p, summ)]
+            if not touched:
+                continue
+            both = len(touched) == 2
+            if best is None or (both and not best[1]):
+                best = (summ, both)
+            if both:
+                break
+        base = {"time_utc": now_iso(), "watch": row["watch"], "gap_opened_utc": row["opened_utc"],
+                "open_slot": lo, "close_slot": hi}
+        if best is None:
+            self.stats["closer_misses"] += 1
+            rec = {**base, "note": "no matching transaction found (the gap may have closed by a price update alone)"}
+        else:
+            summ, both = best
+            cost = summ["fee"] + summ["tip"]
+            rec = {**base, "tx_slot": summ["slot"], "signature": summ["signature"], "signer": summ["signer"],
+                   "success": summ["success"], "touched_both_pools": both,
+                   "jito_tip_sol": round(summ["tip"] / 1e9, 9), "priority_fee_sol": round(summ["priority_fee"] / 1e9, 9),
+                   "total_cost_sol": round(cost / 1e9, 9), "compute_units": summ["compute_units"],
+                   "programs": len(summ["programs"]),
+                   "note": "arbitrage: traded both pools in one transaction" if both else "ordinary trade moved one pool"}
+            self.stats["closers"] += 1
+        self.closers.write(rec)
+        self.recent_closers.append(rec)
+
+    # -- job 2: reality check -------------------------------------------------------------------------
+    def check_random_pool(self) -> None:
+        pools = [(w, p) for w in self.engine.watches for p in w.pools
+                 if p.ready() and (p.kind == "cp" or p.can_quote_depth()) and len(p.history) > 5]
+        if not pools:
+            return
+        w, p = random.choice(pools)
+        sigs = self._sigs(p.address, 15)
+        per_slot = collections.Counter(sg.get("slot") for sg in sigs)
+        tried = 0
+        for sg in sigs:
+            if tried >= 3 or sg.get("err") or sg["signature"] in self.seen:
+                continue
+            if per_slot[sg.get("slot")] > 1:
+                self.stats["check_skips"] += 1        # another trade in the same slot: order unknown, skip
+                continue
+            before = p.state_before(sg["slot"])
+            if before is None:
+                self.stats["check_skips"] += 1
+                continue
+            self.seen.add(sg["signature"])
+            tried += 1
+            summ = self._tx(sg["signature"])
+            flow = pool_flow(p, summ) if summ else None
+            res = check_swap(p, flow, before) if flow else None
+            if not res:
+                self.stats["check_skips"] += 1
+                continue
+            self.stats["checks"] += 1
+            rec = {"time_utc": now_iso(), "watch": w.label, "pool": p.name, "kind": p.kind, "tx_slot": sg["slot"],
+                   "signature": sg["signature"], "direction": res["direction"],
+                   "amount_in": round(res["amount_in"], 9), "actual_out": round(res["actual_out"], 9),
+                   "predicted_out": round(res["predicted_out"], 9), "error_pct": round(res["error_pct"], 5),
+                   "trade_share_of_pool_pct": round(res["share"], 5) if res["share"] is not None else "",
+                   "note": ""}
+            self.checks.write(rec)
+            self.recent_checks.append(rec)
+
+    # -- summaries for the dashboard and report ------------------------------------------------------------
+    def summary(self) -> dict:
+        return summarise_audit(list(self.recent_closers), list(self.recent_checks), dict(self.stats))
+
+
+def summarise_audit(closers: list[dict], checks: list[dict], stats: dict | None = None) -> dict:
+    found = [c for c in closers if c.get("signature")]
+    arbs = [c for c in found if str(c.get("touched_both_pools")) in ("True", "true", "1")]
+    tips = sorted(float(c.get("jito_tip_sol") or 0) for c in found)
+    costs = sorted(float(c.get("total_cost_sol") or 0) for c in found)
+    leaders = collections.Counter(c["signer"] for c in arbs).most_common(8)
+    errs = [abs(float(c["error_pct"])) for c in checks if c.get("error_pct") not in (None, "")]
+    by_kind: dict[str, list] = {}
+    for c in checks:
+        if c.get("error_pct") not in (None, ""):
+            by_kind.setdefault(c["kind"], []).append(abs(float(c["error_pct"])))
+    med = lambda xs: statistics.median(xs) if xs else None
+    return {
+        "closers_found": len(found), "closers_total": len(closers), "by_arbitrage_bots": len(arbs),
+        "tipped": sum(t > 0 for t in tips), "median_tip_sol": med(tips), "median_cost_sol": med(costs),
+        "max_tip_sol": tips[-1] if tips else None,
+        "leaders": [{"signer": s, "wins": n} for s, n in leaders],
+        "checks": len(errs), "median_error_pct": med(errs),
+        "within_0_1_pct": sum(e <= 0.1 for e in errs), "within_1_pct": sum(e <= 1 for e in errs),
+        "error_by_kind": {k: {"n": len(v), "median_error_pct": med(v)} for k, v in by_kind.items()},
+        "recent_closers": closers[-25:][::-1], "recent_checks": checks[-40:],
+        "stats": stats or {},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Live watching
 # ---------------------------------------------------------------------------
 def snapshot(engine: Engine, rpc) -> None:
@@ -1417,6 +1849,9 @@ def find_pools(mint: str, rpc, pairs: list[dict], quotes: set[str], max_pools: i
             if {ma, mb} != {mint, other}:
                 notes.append(f"skip {addr[:8]}… ({dex}): pool data did not match the expected layout")
                 continue
+            if kind == "damm2" and (len(data) < DAMM2["fee_b"] + 32 or data[DAMM2["status"]] != 0):
+                notes.append(f"skip {addr[:8]}… ({dex}): pool is disabled or its data is incomplete")
+                continue
             missing = [m for m in (mint, other) if m not in decimals]
             if missing:
                 decimals.update(mint_decimals(rpc, missing))
@@ -1431,6 +1866,8 @@ def find_pools(mint: str, rpc, pairs: list[dict], quotes: set[str], max_pools: i
                     notes.append(f"note {addr[:8]}… ({dex}): fee not readable, assuming 0.25%")
             else:
                 fee = live_fee(kind, data)
+            if kind == "damm2":
+                notes.append(f"note {addr[:8]}… ({dex}): using its base fee, the most it can charge")
             entry = dict(name=f"{dex} {addr[:4]}", kind=kind, address=addr, quote_mint=other,
                          quote_decimals=decimals[other], token_is_a=(ma == mint), fee=round(fee, 8),
                          liquidity_usd=round(liq))
@@ -1593,6 +2030,8 @@ def report(folder: Path, raw_path: Path | None = None) -> str:
                 nets = [float(d["peak_net_quote"]) for d in exact if d["quote"] == unit]
                 out.append(f"    exact pairs: median best net {statistics.median(nets):.6f} {unit}, "
                            f"largest {max(nets):.6f} {unit}, sum of peaks {sum(nets):.6f} {unit}")
+    out += loops_report(folder)
+    out += audit_report(folder)
     out += lp_report(folder)
     out += ["", "WHAT THIS MEANS"]
     if hours < 1:
@@ -1622,6 +2061,48 @@ def report(folder: Path, raw_path: Path | None = None) -> str:
     out.append("- 'Best net' (exact Raydium/PumpSwap pairs only) is a ceiling from pool maths minus your cost "
                "assumption, not a fill.")
     return "\n".join(out)
+
+
+def loops_report(folder: Path) -> list[str]:
+    rows = read_csv(folder / "loops.csv")
+    out = ["", "TRIANGLE LOOPS (SOL -> token -> USDC -> SOL and back, every swap simulated on its own pool)"]
+    if not rows:
+        return out + ["  None profitable after all three swaps, their fees and your cost. (Needs a token with both "
+                      "SOL and USDC pools that Orbit can simulate.)"]
+    slots = [int(r["slots_open"]) for r in rows]
+    best = [float(r["best_net_sol"]) for r in rows]
+    out.append(f"  {len(rows)} profitable loops seen; closed within 1 slot: {pct(sum(x <= 1 for x in slots), len(slots))}; "
+               f"median open {statistics.median(slots):.0f} slots; best single loop {max(best):+.6f} SOL")
+    for label in sorted({r["watch"] for r in rows}):
+        mine = [r for r in rows if r["watch"] == label]
+        out.append(f"  {label}: {len(mine)} loops, median best {statistics.median(float(r['best_net_sol']) for r in mine):+.6f} SOL")
+    return out
+
+
+def audit_report(folder: Path) -> list[str]:
+    a = summarise_audit(read_csv(folder / "closers.csv"), read_csv(folder / "quote_checks.csv"))
+    out = ["", "WHO CLOSED THE GAPS (the real transactions, looked up after each gap closed)"]
+    if not a["closers_total"]:
+        out.append("  Nothing looked up yet.")
+    else:
+        out.append(f"  Found the closing transaction for {a['closers_found']} of {a['closers_total']} gaps; "
+                   f"{a['by_arbitrage_bots']} were arbitrage bots trading both pools in one transaction.")
+        if a["median_tip_sol"] is not None:
+            out.append(f"  Median Jito tip {a['median_tip_sol']:.6f} SOL (largest {a['max_tip_sol']:.6f}); "
+                       f"median total cost {a['median_cost_sol']:.6f} SOL; {a['tipped']} paid a tip.")
+        for l in a["leaders"][:5]:
+            out.append(f"  winner {l['signer'][:6]}…{l['signer'][-4:]}: {l['wins']} gaps")
+    out += ["", "PRICE-MATHS REALITY CHECK (Orbit's prediction vs real swaps, from the pool state just before)"]
+    if not a["checks"]:
+        out.append("  No swaps checked yet.")
+    else:
+        out.append(f"  {a['checks']} real swaps re-quoted: median error {a['median_error_pct']:.4f}%; "
+                   f"within 0.1%: {pct(a['within_0_1_pct'], a['checks'])}; within 1%: {pct(a['within_1_pct'], a['checks'])}")
+        for k, v in sorted(a["error_by_kind"].items()):
+            out.append(f"  {k}: {v['n']} swaps, median error {v['median_error_pct']:.4f}%")
+        out.append("  Large errors on concentrated pools usually mean the trade crossed a price tick, which Orbit's "
+                   "single-range maths does not model: treat big-trade depth checks there as optimistic.")
+    return out
 
 
 def lp_report(folder: Path) -> list[str]:

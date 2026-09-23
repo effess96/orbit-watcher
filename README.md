@@ -141,6 +141,31 @@ sense is started again automatically. "Reset tracking" on the dashboard starts e
 the dashboard ("Pool earnings") and in the report. Judge them after several days: one sharp price move
 can wipe out weeks of fees, especially on memecoins. Meteora and constant-product pools are not measured.
 
+## Reading real transactions (who took it, reality check)
+
+A background worker looks up real transactions, gently (about one RPC call every 0.7 s), and writes:
+
+- **`closers.csv`, who took the gaps.** For every closed gap, the transaction that closed it: winning wallet, Jito
+  tip, total cost, and whether it bought on one pool and sold on the other in one transaction (an arbitrage bot).
+- **`quote_checks.csv`, reality check.** Every ~45 s, a real swap in a watched pool is re-quoted from the pool state
+  just before it and compared with what actually came out. Small errors mean the depth checks and earnings can be
+  trusted; large errors on concentrated pools usually mean the trade crossed a price tick.
+
+Set `ORBIT_AUDIT=0` to switch the worker off (for example on a public RPC that limits requests).
+
+## Triangle loops
+
+For tokens with both a SOL and a USDC pool, Orbit also simulates the full loop SOL → token → USDC → SOL (and back)
+with all three swaps on their own pools, including the SOL/USDC pool's depth and fee. Profitable loops are timed
+like gaps and written to `loops.csv`.
+
+## Pool types
+
+Supported: Raydium AMM v4, Raydium CPMM, PumpSwap, Orca Whirlpool, Raydium CLMM, Meteora DLMM, and **Meteora
+DAMM v2** (priced from its account using Meteora's published layout; its base fee is used, the most it can charge).
+Not supported, on purpose: SolFi and Vertigo price trades with private logic or unpublished curves, so reading their
+vaults would show gaps that are not real.
+
 ## Output files (folder `data/`)
 
 - `dislocations.csv`: one row per profitable gap: which pools, when it opened, slots and seconds open, peak gap %, peak net profit, best trade size.

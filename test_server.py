@@ -12,7 +12,9 @@ import json
 import tempfile
 import threading
 import time
+import os
 import unittest
+os.environ.setdefault("ORBIT_AUDIT", "0")   # no background RPC lookups in tests
 from pathlib import Path
 
 import server as S
