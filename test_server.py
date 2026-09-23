@@ -301,22 +301,92 @@ class Helpers(unittest.TestCase):
             rows = S.tail_csv(p, 3)
             self.assertEqual([r["a"] for r in rows], ["19999", "19998", "19997"])
 
-    def test_raw_log_rotation(self):
+    def test_raw_log_is_compressed_into_the_archive(self):
+        import gzip
         with tempfile.TemporaryDirectory() as d:
             app = S.App(Path(d), PASSWORD)
             app.recorder = W.Recorder(app.out)
-            app.recorder.raw_fh.write("x" * 100)
+            app.recorder.raw(0.0, "v", 1, 2)
+            app.recorder.raw(7200.0, "v", 2, 3)
+            with contextlib.redirect_stdout(io.StringIO()):
+                app.rotate_raw(wait=True)
+            idx = app.raw_index()
+            self.assertEqual(len(idx), 1)
+            self.assertEqual((idx[0]["updates"], idx[0]["hours"]), (2, 2.0))
+            gz = app.archive / "raw" / idx[0]["file"]
+            self.assertEqual(gzip.open(gz, "rt").read().count("\n"), 2)
+            self.assertFalse(list((app.archive / "raw").glob("*.jsonl")))       # plain copy removed
+            app.recorder.raw(7300.0, "v", 3, 4)                                 # a fresh live file keeps going
+            app.recorder.raw_fh.flush()
+            self.assertEqual((app.out / "raw_updates.jsonl").read_text().count("\n"), 1)
+            self.assertIn("Observed: 2.00 hours, 3 pool updates.", W.report(app.out))
+            self.assertEqual(len(app.archives()["raw"]), 1)
+            app.recorder.close()
+
+    def test_old_raw_files_are_removed_past_the_size_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            app = S.App(Path(d), PASSWORD)
+            app.recorder = W.Recorder(app.out)
+            old = S.RAW_KEEP_MB
+            S.RAW_KEEP_MB = 0.0001
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    for k in range(3):
+                        for n in range(50):
+                            app.recorder.raw(float(n), f"acct{k}{n}", n, n)
+                        app.rotate_raw(wait=True)
+                        time.sleep(1.1)                                         # distinct file names
+            finally:
+                S.RAW_KEEP_MB = old
+            self.assertEqual(len(app.raw_index()), 1)                           # newest kept
+            self.assertEqual(len(list((app.archive / "raw").glob("*.gz"))), 1)
+            app.recorder.close()
+
+    def test_maintain_rotates_by_size(self):
+        with tempfile.TemporaryDirectory() as d:
+            app = S.App(Path(d), PASSWORD)
+            app.recorder = W.Recorder(app.out)
+            app.recorder.raw(1.0, "v", 1, 2)
             app.recorder.raw_fh.flush()
             old = S.RAW_ROTATE_BYTES
             S.RAW_ROTATE_BYTES = 10
             try:
-                app.maintain()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    app.maintain()
+                    time.sleep(0.5)
             finally:
                 S.RAW_ROTATE_BYTES = old
-            self.assertTrue((app.out / "raw_updates.1.jsonl").exists())
-            app.recorder.raw(1.0, "v", 1, 2)
+            self.assertEqual((app.out / "raw_updates.jsonl").stat().st_size, 0)
             app.recorder.close()
-            self.assertEqual((app.out / "raw_updates.jsonl").read_text().count("\n"), 1)
+
+    def test_reset_saves_a_copy_first_and_bundle_has_no_raw_or_secrets(self):
+        import zipfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        app = S.App(Path(d), PASSWORD)
+        app.recorder = W.Recorder(Path(app.out))
+        self.addCleanup(app.recorder.close)
+        app.engine = W.Engine({"watches": []}, app.recorder)
+        app.recorder.raw(1.0, "v", 1, 2)
+        app.logs.append("Auditor: https://mainnet.helius-rpc.com/?api-key=SECRET123 failed; bot123456:ABCdef token")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(app.reset_earnings())
+        reps = app.archives()["reports"]
+        self.assertEqual(len(reps), 1)
+        self.assertTrue(reps[0]["name"].endswith("before-reset"))
+        folder = app.archive / "reports" / reps[0]["name"]
+        self.assertTrue((folder / "report.txt").exists() and (folder / "dislocations.csv").exists())
+        z = zipfile.ZipFile(io.BytesIO(app.report_archive_zip(reps[0]["name"])))
+        self.assertTrue(any(n.endswith("report.txt") for n in z.namelist()))
+        self.assertIsNone(app.report_archive_zip("../../etc"))
+        z = zipfile.ZipFile(io.BytesIO(app.bundle()))
+        names = z.namelist()
+        self.assertTrue(any(n.endswith("/report.txt") for n in names))
+        self.assertTrue(any("/previous_reports/" in n for n in names))
+        self.assertFalse(any("raw" in n for n in names))
+        text = "".join(z.read(n).decode() for n in names)
+        self.assertNotIn("SECRET123", text)
+        self.assertNotIn("ABCdef", text)
 
     def test_refuses_short_password(self):
         import os

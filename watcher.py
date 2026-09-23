@@ -28,11 +28,13 @@ import base64
 import collections
 import copy
 import csv
+import gzip
 import hashlib
 import json
 import math
 import os
 import random
+import re
 import ssl
 import statistics
 import threading
@@ -404,6 +406,18 @@ class Recorder:
             self.raw_fh.flush()
             self._last_flush = time.monotonic()
 
+    def rotate_raw(self, dest: Path) -> Path | None:
+        """Close the current raw log, move it aside and start a fresh one. Returns the moved file (uncompressed)."""
+        src = self.folder / "raw_updates.jsonl"
+        if not self.raw_fh or not src.exists() or src.stat().st_size == 0:
+            return None
+        self.raw_fh.close()
+        dest.mkdir(parents=True, exist_ok=True)
+        moved = dest / f"raw_{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.jsonl"
+        src.replace(moved)
+        self.raw_fh = open(src, "a", encoding="utf-8")
+        return moved
+
     def write_json(self, name: str, data: dict) -> None:
         tmp = self.folder / (name + ".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -587,6 +601,9 @@ LP_START_VALUE = 100.0       # paper position size, in the pool's quote (SOL or 
 MAX_FEE_STEP = 0.01          # sanity cap: one update can add at most 1% of the position in fees
 MAX_FEE_TOTAL = 10.0         # sanity cap: total fees above 1000% of the position mean something broke
 LP_CAPITAL_SOL = float(os.environ.get("ORBIT_LP_CAPITAL_SOL", 2.5))   # your money, for the SOL columns
+LP_MIN_HOURS = 1.0            # below this, per-day and break-even figures are 'too early'
+MAX_BREAK_EVEN_DAYS = 365     # slower than this counts as 'never at this pace'
+TX_VERSION = 1               # newest transaction version the auditor asks the node for
 LP_TX_COST_SOL = 0.001       # network fees to open and later close a position (both directions)
 Q64, U128 = 2 ** 64, 2 ** 128
 
@@ -682,6 +699,11 @@ class LpSim:
         sol_day = per_day / 100 * LP_CAPITAL_SOL
         cost = self.cost_sol()
         days = max(round(cost / sol_day, 2), 0.01) if sol_day > 1e-12 else None
+        if days is not None and days > MAX_BREAK_EVEN_DAYS:   # a pace this slow never pays back in practice
+            days = None
+        early = hours < LP_MIN_HOURS
+        if early:                                  # per-day figures from a few minutes of data are noise
+            days = None
         return {"range_pct": round(self.width * 100), "hours": round(hours, 2),
                 "in_range_pct": round(100 * self.in_range_s / (hours * 3600), 1),
                 "fees_pct": round(pct(fees), 4), "fees_per_day_pct": round(pct(fees) * 24 / hours, 4),
@@ -690,7 +712,7 @@ class LpSim:
                 "best_net_pct": round(self.best, 4),
                 "capital_sol": LP_CAPITAL_SOL, "cost_sol": round(cost, 5),
                 "net_sol_per_day": round(sol_day, 5), "days_to_break_even": days,
-                "skipped_updates": self.skipped,
+                "skipped_updates": self.skipped, "early": early,
                 "in_range_now": self.sa <= self.pool.sq <= self.sb}
 
     def state(self) -> dict:
@@ -1517,8 +1539,15 @@ class Auditor:
         return self.rpc.call(method, params)
 
     def _tx(self, sig: str) -> dict | None:
-        tx = self._call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0,
-                                                 "commitment": "confirmed"}])
+        opts = {"encoding": "jsonParsed", "maxSupportedTransactionVersion": TX_VERSION, "commitment": "confirmed"}
+        try:
+            tx = self._call("getTransaction", [sig, opts])
+        except Exception as e:                    # the node names the newest version it needs: ask again with it
+            m = re.search(r'maxSupportedTransactionVersion"?\s*:\s*(\d+)', str(e))
+            if not m or int(m.group(1)) == opts["maxSupportedTransactionVersion"]:
+                raise
+            opts["maxSupportedTransactionVersion"] = int(m.group(1))
+            tx = self._call("getTransaction", [sig, opts])
         return parse_tx(tx)
 
     def _sigs(self, addr: str, limit: int) -> list[dict]:
@@ -1963,11 +1992,16 @@ def read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
+def open_raw(path: Path):
+    """Open a raw log, plain or gzip-compressed."""
+    return gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz" else open(path, encoding="utf-8")
+
+
 def raw_span(path: Path) -> tuple[int, float]:
     """(number of updates, hours covered) from the raw log."""
     count, first, last = 0, None, None
     if path.exists():
-        with open(path, encoding="utf-8") as fh:
+        with open_raw(path) as fh:
             for line in fh:
                 try:
                     t = json.loads(line)["t"]
@@ -1983,10 +2017,22 @@ def pct(part: int, whole: int) -> str:
     return f"{100 * part / whole:.0f}%" if whole else "n/a"
 
 
+def raw_archive_totals(folder: Path) -> tuple[int, float]:
+    """(updates, hours) already moved into compressed raw archives."""
+    try:
+        idx = json.loads((folder / "archive" / "raw" / "index.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0, 0.0
+    return sum(x.get("updates", 0) for x in idx), sum(x.get("hours", 0.0) for x in idx)
+
+
 def report(folder: Path, raw_path: Path | None = None) -> str:
     dis = read_csv(folder / "dislocations.csv")
     shocks = read_csv(folder / "shocks.csv")
     updates, hours = raw_span(raw_path or folder / "raw_updates.jsonl")
+    if raw_path is None:
+        u2, h2 = raw_archive_totals(folder)
+        updates, hours = updates + u2, hours + h2
     out = ["ORBIT DISLOCATION WATCHER — REPORT", "=" * 34,
            f"Observed: {hours:.2f} hours, {updates} pool updates.", ""]
     vis = sum(1 for s in shocks if s["profitable_gap_visible"] == "yes")
@@ -2105,6 +2151,22 @@ def audit_report(folder: Path) -> list[str]:
     return out
 
 
+def lp_report_rows(rows: list) -> list[str]:
+    out = []
+    for name, r in sorted(rows, key=lambda x: -x[1]["net_vs_hold_pct"]):
+        days = r.get("days_to_break_even")
+        if r.get("early", r["hours"] < LP_MIN_HOURS):
+            out.append(f"  +/-{r['range_pct']}% | {name} | {r['hours']:.1f} h | {r['in_range_pct']:.0f}% | "
+                       f"{r['fees_pct']:+.3f}% | too early | {r['price_move_pct']:+.3f}% | "
+                       f"{r['net_vs_hold_pct']:+.3f}% | {r.get('worst_net_pct', 0):+.3f}% | too early | too early")
+            continue
+        out.append(f"  +/-{r['range_pct']}% | {name} | {r['hours']:.1f} h | {r['in_range_pct']:.0f}% | "
+                   f"{r['fees_pct']:+.3f}% | {r['fees_per_day_pct']:+.3f}% | {r['price_move_pct']:+.3f}% | "
+                   f"{r['net_vs_hold_pct']:+.3f}% | {r.get('worst_net_pct', 0):+.3f}% | "
+                   f"{r.get('net_sol_per_day', 0):+.5f} SOL | " + (f"{days:.2f}" if days else "never at this pace"))
+    return out
+
+
 def lp_report(folder: Path) -> list[str]:
     path = folder / "lp_state.json"
     try:
@@ -2118,12 +2180,9 @@ def lp_report(folder: Path) -> list[str]:
     out = ["", f"POOL EARNINGS (paper {LP_START_VALUE:.0f}-unit positions, Orca and Raydium CLMM pools only)",
            "  range | pool | hours | in range | fees | fees/day | price-move loss | net vs holding | "
            f"worst so far | on {cap:g} SOL/day | days to break even"]
-    for name, r in sorted(rows, key=lambda x: -x[1]["net_vs_hold_pct"]):
-        days = r.get("days_to_break_even")
-        out.append(f"  +/-{r['range_pct']}% | {name} | {r['hours']:.1f} h | {r['in_range_pct']:.0f}% | "
-                   f"{r['fees_pct']:+.3f}% | {r['fees_per_day_pct']:+.3f}% | {r['price_move_pct']:+.3f}% | "
-                   f"{r['net_vs_hold_pct']:+.3f}% | {r.get('worst_net_pct', 0):+.3f}% | "
-                   f"{r.get('net_sol_per_day', 0):+.5f} SOL | " + (f"{days:.1f}" if days else "never at this pace"))
+    out += lp_report_rows(rows)
+    out.append(f"  Per-day figures and break-even stay 'too early' until a position has {LP_MIN_HOURS:g} h of data; "
+               f"a pace that needs more than {MAX_BREAK_EVEN_DAYS} days to pay back is shown as 'never at this pace'.")
     out.append("  'Net vs holding' = fees + price-move loss. Positive means providing liquidity beat just holding "
                "the coins. Less than 3 days of data says little: one big price move can erase weeks of fees.")
     out.append(f"  'On {cap:g} SOL/day' is today's pace applied to your own capital. 'Days to break even' compares "
@@ -2137,7 +2196,7 @@ def replay(config: dict, raw_path: Path, out_folder: Path) -> Engine:
     rec = Recorder(out_folder, keep_raw=False)
     engine = Engine(config, rec)
     current_slot, last_t = None, 0.0
-    with open(raw_path, encoding="utf-8") as fh:
+    with open_raw(raw_path) as fh:
         for line in fh:
             try:
                 r = json.loads(line)

@@ -33,6 +33,9 @@ button{background:#1c2733;color:var(--text);border:1px solid #2b3b4f;border-radi
 button:hover{border-color:#3d526b}
 button.primary{background:var(--green);color:#06281a;border-color:var(--green);font-weight:600}
 button.danger{color:var(--red)}
+a.btn{display:inline-block;background:var(--green);color:#06281a;border-radius:7px;padding:7px 12px;font-weight:600;font-size:14px;text-decoration:none;letter-spacing:0}
+.muted{color:var(--muted,#8b9bb0)}
+section h3{font-size:13px;margin:12px 0 6px;color:#8b9bb0;font-weight:600}
 button:disabled{opacity:.5;cursor:wait}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .watch{border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
@@ -305,7 +308,25 @@ section,.watch{min-width:0}
   <section>
     <h2>Report <button id="refresh-report">Refresh</button></h2>
     <pre id="report">Loading…</pre>
-    <p class="note">Downloads: <a href="/download/dislocations.csv">dislocations.csv</a> · <a href="/download/shocks.csv">shocks.csv</a> · <a href="/download/raw_updates.jsonl">raw_updates.jsonl</a></p>
+  </section>
+
+  <section>
+    <h2>Saved reports &amp; data <a class="btn primary" href="/download/bundle.zip">Download analysis bundle</a> <button id="arc-save">Save a copy now</button></h2>
+    <p class="note">The <b>analysis bundle</b> is what to send Claude: the report, every CSV, the earnings, the dashboard state, recent activity and all earlier reports, in one small zip. It leaves out the heavy raw price data, so there's no need to upload raw_updates any more. API keys and bot tokens are masked.</p>
+    <div class="two">
+      <div>
+        <h3>Earlier reports</h3>
+        <div class="scroll"><table><thead><tr><th>Saved (UTC)</th><th>Why</th><th>Size</th><th></th></tr></thead><tbody id="arc-rep"></tbody></table></div>
+        <div id="arc-rep-empty" class="empty">None yet. A copy is saved automatically every time you press Reset tracking.</div>
+      </div>
+      <div>
+        <h3>Raw price data (compressed)</h3>
+        <div class="scroll"><table><thead><tr><th>From (UTC)</th><th>Hours</th><th>Updates</th><th>Size</th><th></th></tr></thead><tbody id="arc-raw"></tbody></table></div>
+        <div id="arc-raw-empty" class="empty">None yet.</div>
+        <p class="note" id="arc-raw-note"></p>
+      </div>
+    </div>
+    <p class="note">Single files: <a href="/download/dislocations.csv">dislocations.csv</a> · <a href="/download/shocks.csv">shocks.csv</a> · <a href="/download/loops.csv">loops.csv</a> · <a href="/download/closers.csv">closers.csv</a> · <a href="/download/quote_checks.csv">quote_checks.csv</a> · <a href="/download/raw_updates.jsonl">current raw file</a></p>
   </section>
 
   <section>
@@ -606,7 +627,7 @@ function renderInsights(s) {
     const v = top.net_vs_hold_pct;
     const sol = top.net_sol_per_day || 0;
     gauge($("g-lp"), Math.max(0, Math.min(1, v / 1)), pct(v),
-      `${top.pool} ±${top.range_pct}% · ${top.watch} · ${sol >= 0 ? "+" : ""}${fmt(sol, 5)} SOL/day on ${fmt(top.capital_sol, 2)} SOL`,
+      `${top.pool} ±${top.range_pct}% · ${top.watch} · ` + (top.early ? "per day: too early" : `${sol >= 0 ? "+" : ""}${fmt(sol, 5)} SOL/day on ${fmt(top.capital_sol, 2)} SOL`),
       v >= 0 ? good : bad);
   } else gauge($("g-lp"), 0, "–", "waiting for data", cssv("--muted"));
   const ahead = live.filter(r => r.net_vs_hold_pct > 0).length, inr = live.filter(r => r.in_range_now).length;
@@ -625,16 +646,17 @@ function renderInsights(s) {
     fl.push({label: "  price-move loss", value: r.price_move_pct, color: bad, text: pct(r.price_move_pct)});
   }
   bars($("b-feeloss"), fl, "Waiting for data.");
-  const solNow = live.length ? Math.max(...live.map(r => r.net_sol_per_day || 0)) : 0;
+  const ready = live.filter(r => !r.early);
+  const solNow = ready.length ? Math.max(...ready.map(r => r.net_sol_per_day || 0)) : 0;
   const worstNow = live.length ? Math.min(...live.map(r => r.net_vs_hold_pct)) : 0;
   gauge($("g-sol"), Math.max(0, Math.min(1, solNow / 0.05)), `${solNow >= 0 ? "+" : ""}${fmt(solNow, 5)} SOL`,
-    live.length ? `per day on ${fmt(live[0].capital_sol, 2)} SOL · best of ${live.length}` : "waiting for data",
+    ready.length ? `per day on ${fmt(ready[0].capital_sol, 2)} SOL · best of ${ready.length}` : live.length ? "too early: needs 1 hour of data" : "waiting for data",
     solNow > 0 ? good : cssv("--muted"));
   gauge($("g-worst"), Math.max(0, Math.min(1, Math.abs(worstNow) / 5)), pct(worstNow),
     live.length ? "the position doing worst right now" : "waiting for data", worstNow >= 0 ? good : bad);
-  const pays = live.filter(r => r.days_to_break_even !== null && r.days_to_break_even !== undefined && r.days_to_break_even <= 7).length;
+  const pays = ready.filter(r => r.days_to_break_even !== null && r.days_to_break_even !== undefined && r.days_to_break_even <= 7).length;
   const never = live.filter(r => (r.worst_net_pct || 0) >= 0).length;
-  meter($("m-pay"), "Pays for itself within a week", pays, live.length, pays ? good : cssv("--warning"), `${pays} of ${live.length} positions`);
+  meter($("m-pay"), "Pays for itself within a week", pays, ready.length || 1, pays ? good : cssv("--warning"), ready.length ? `${pays} of ${ready.length} positions` : "too early");
   meter($("m-never"), "Never dipped below holding", never, live.length, never ? good : cssv("--warning"), `${never} of ${live.length} positions`);
   const fresh = live.filter(r => r.in_range_now).length;
   meter($("m-fresh"), "Earning fees right now", fresh, live.length, fresh === live.length ? good : cssv("--warning"), `${fresh} of ${live.length} in range`);
@@ -664,6 +686,7 @@ function renderInsights(s) {
     r.best_depth_sol === null ? "unknown (Meteora)" : el("span", {class: r.best_depth_sol > 0 ? "pos" : "neg", text: `${fmt(r.best_depth_sol, 4)} SOL`})]);
 }
 
+const early = () => el("span", {class: "muted", title: "Needs at least 1 hour of data", text: "too early"});
 let lastLp = [], lpSort = {k: "net_vs_hold_pct", asc: false};
 function renderLp() {
   const tokSel = $("lp-token"), tokens = [...new Set(lastLp.map(r => r.watch))].sort();
@@ -684,10 +707,10 @@ function renderLp() {
     + (skipped ? ` · ${skipped} odd pool readings ignored` : "");
   const pc = v => el("span", {class: v >= 0 ? "pos" : "neg", text: (v >= 0 ? "+" : "") + fmt(v, 3) + "%"});
   const line = r => el("tr", {}, [r.watch || "", `${r.pool} (${r.quote})`, `±${r.range_pct}%`, `${fmt(r.hours, 1)} h`,
-    `${fmt(r.in_range_pct, 0)}%${r.in_range_now ? "" : " (out now)"}`, pc(r.fees_pct), pc(r.fees_per_day_pct),
+    `${fmt(r.in_range_pct, 0)}%${r.in_range_now ? "" : " (out now)"}`, pc(r.fees_pct), r.early ? early() : pc(r.fees_per_day_pct),
     pc(r.price_move_pct), pc(r.net_vs_hold_pct), pc(r.worst_net_pct || 0),
-    el("span", {class: (r.net_sol_per_day || 0) >= 0 ? "pos" : "neg", text: `${(r.net_sol_per_day || 0) >= 0 ? "+" : ""}${fmt(r.net_sol_per_day, 5)} SOL`}),
-    r.days_to_break_even === null || r.days_to_break_even === undefined ? "never at this pace" : `${fmt(r.days_to_break_even, 2)} d`,
+    r.early ? early() : el("span", {class: (r.net_sol_per_day || 0) >= 0 ? "pos" : "neg", text: `${(r.net_sol_per_day || 0) >= 0 ? "+" : ""}${fmt(r.net_sol_per_day, 5)} SOL`}),
+    r.early ? early() : r.days_to_break_even === null || r.days_to_break_even === undefined ? "never at this pace" : `${fmt(r.days_to_break_even, 2)} d`,
   ].map(c => c instanceof Node ? el("td", {}, c) : el("td", {text: c})));
   const out = [];
   if (group) {
@@ -823,15 +846,37 @@ document.querySelectorAll("#lp-head th[data-k]").forEach(th => th.addEventListen
   renderLp();
 }));
 $("lp-reset").addEventListener("click", async () => {
-  if (!confirm("Forget every paper position and start again from current prices? Past earnings history is lost.")) return;
-  try { await api("/api/lp/reset", {}); lastLp = []; renderLp(); refresh(); }
+  if (!confirm("Start every paper position again from current prices? The current report and earnings are saved first under 'Saved reports & data'.")) return;
+  try { await api("/api/lp/reset", {}); lastLp = []; renderLp(); refresh(); loadArchives(); }
   catch (e) { alert(e.message); }
 });
 $("w-expand").addEventListener("click", () => setAllWatches(true));
 $("w-collapse").addEventListener("click", () => setAllWatches(false));
-refresh(); loadReport();
+const bytes = n => n >= 1e6 ? fmt(n / 1e6, 1) + " MB" : fmt(n / 1e3, 0) + " KB";
+const stamp = t => t ? new Date(t * 1000).toISOString().slice(0, 16).replace("T", " ") : "–";
+async function loadArchives() {
+  try {
+    const a = await api("/api/archives");
+    renderTable("arc-rep", "arc-rep-empty", a.reports, r => {
+      const m = r.name.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})\d{2}-(.*)$/);
+      return [m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}` : r.name, m ? m[6].replace("-", " ") : "", bytes(r.bytes),
+        el("a", {href: `/download/archive/report/${encodeURIComponent(r.name)}`, text: "Download"})]; });
+    renderTable("arc-raw", "arc-raw-empty", a.raw, r => [stamp(r.from), fmt(r.hours, 1), fmt(r.updates, 0), bytes(r.bytes),
+      el("a", {href: `/download/archive/raw/${encodeURIComponent(r.file)}`, text: "Download"})]);
+    const used = a.raw.reduce((x, r) => x + r.bytes, 0);
+    $("arc-raw-note").textContent = `Current file ${bytes(a.raw_live_bytes)} (compressed every ${a.rotate_hours} h). `
+      + `Archive uses ${bytes(used)} of ${fmt(a.raw_keep_mb, 0)} MB; the oldest files are removed past that.`;
+  } catch (e) { $("arc-raw-note").textContent = e.message; }
+}
+$("arc-save").addEventListener("click", async e => {
+  e.target.disabled = true;
+  try { await api("/api/archive/save", {}); await loadArchives(); } catch (err) { alert(err.message); }
+  e.target.disabled = false;
+});
+refresh(); loadReport(); loadArchives();
 setInterval(refresh, 3000);
 setInterval(loadReport, 60000);
+setInterval(loadArchives, 60000);
 </script>
 </body>
 </html>

@@ -27,12 +27,17 @@ import io
 import json
 import os
 import secrets
+import io
+import re
+import shutil
 import sys
 import threading
+import zipfile
 import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -40,9 +45,21 @@ import watcher as W
 
 ROOT = Path(__file__).resolve().parent
 SESSION_HOURS = 12
-RAW_ROTATE_BYTES = 200 * 1024 * 1024
-DOWNLOADS = {"dislocations.csv": "text/csv", "shocks.csv": "text/csv",
+RAW_ROTATE_BYTES = 64 * 1024 * 1024                 # move the raw log aside at this size...
+RAW_ROTATE_HOURS = 6                                # ...or this age, then gzip it (about 7x smaller)
+RAW_KEEP_MB = float(os.environ.get("ORBIT_RAW_KEEP_MB", 1000))   # oldest compressed raw files go past this
+DOWNLOADS = {"dislocations.csv": "text/csv", "shocks.csv": "text/csv", "loops.csv": "text/csv",
+             "closers.csv": "text/csv", "quote_checks.csv": "text/csv",
              "raw_updates.jsonl": "application/x-ndjson"}
+BUNDLE_FILES = ("dislocations.csv", "shocks.csv", "loops.csv", "closers.csv", "quote_checks.csv",
+                "lp_state.json", "latency.json")
+ARCHIVE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+SECRET_IN_TEXT = re.compile(r"(api[-_]?key=)[^&\s\"']+|(bot)\d+:[A-Za-z0-9_-]+", re.I)
+
+
+def redact(text: str) -> str:
+    """Hide API keys and bot tokens before anything leaves the server in a bundle."""
+    return SECRET_IN_TEXT.sub(lambda m: (m.group(1) or m.group(2)) + "***", text)
 GECKO_NEW_POOLS = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"
 HUNTER_DEFAULTS = {"enabled": False, "min_liquidity_usd": 10_000, "max_temp": 3, "minutes": 30, "every_s": 300}
 
@@ -170,6 +187,9 @@ class App:
         self.last_hunt = 0.0
         self.history: collections.deque = collections.deque(maxlen=720)   # 1 hour at 5-second samples
         self._rates = {"t": 0.0}
+        self.archive = self.out / "archive"
+        self.raw_started = time.time()
+        self.raw_lock = threading.Lock()
 
     # -- config -------------------------------------------------------------
     def config(self) -> dict:
@@ -195,6 +215,12 @@ class App:
     async def supervise(self) -> None:
         self.loop = asyncio.get_running_loop()
         self.recorder = W.Recorder(self.out)
+        old = self.out / "raw_updates.1.jsonl"          # left over from the old one-file rotation
+        if old.exists():
+            (self.archive / "raw").mkdir(parents=True, exist_ok=True)
+            moved = self.archive / "raw" / f"raw_{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-old.jsonl"
+            old.replace(moved)
+            threading.Thread(target=self._compress_raw, args=(moved,), daemon=True).start()
         await self.restart()
         asyncio.get_running_loop().create_task(self._sample_loop())
         while True:
@@ -265,7 +291,8 @@ class App:
                              "tradable": e.stats.get("tradable", 0),
                              "shocks": e.stats.get("shocks", 0),
                              "lp": {f"{r['pool']} ±{r['range_pct']}%": r["net_vs_hold_pct"] for r in rows},
-                             "lp_sol": {f"{r['pool']} ±{r['range_pct']}%": r["net_sol_per_day"] for r in rows},
+                             "lp_sol": {f"{r['pool']} ±{r['range_pct']}%": r["net_sol_per_day"] for r in rows
+                                        if not r.get("early")},
                              "loop": {w.label: round(w.loop_best, 6) for w in e.watches if w.loop_best is not None}})
 
     def rates(self) -> dict:
@@ -295,10 +322,154 @@ class App:
         e = self.engine
         if not e:
             return False
+        try:
+            if e.lp.path:
+                e.lp.save()                           # freshest numbers into the archive
+        except Exception:
+            pass
+        try:
+            name = self.save_archive("before-reset")
+        except Exception as err:                      # a failed copy must not block the reset
+            name = f"not saved ({type(err).__name__}: {err})"
         e.lp.reset()
         self.history.clear()
-        print("Pool earnings tracking reset: all paper positions start again from now.", flush=True)
+        print(f"Pool earnings tracking reset: all paper positions start again from now "
+              f"(old results kept in archive {name}).", flush=True)
         return True
+
+    # -- archives ---------------------------------------------------------------
+    def save_archive(self, reason: str = "manual") -> str:
+        """Copy the report, earnings and small CSVs into archive/reports/<time>-<reason>/ (raw data excluded)."""
+        if self.recorder and self.recorder.raw_fh and not self.recorder.raw_fh.closed:
+            self.recorder.raw_fh.flush()
+        name = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{re.sub(r'[^a-z0-9-]', '', reason.lower())[:20]}"
+        folder = self.archive / "reports" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        for f in BUNDLE_FILES:
+            if (self.out / f).exists():
+                shutil.copy2(self.out / f, folder / f)
+        try:
+            text = W.report(self.out)
+        except Exception as err:
+            text = f"Report could not be built: {type(err).__name__}: {err}"
+        (folder / "report.txt").write_text(text, encoding="utf-8")
+        try:
+            rows = self.lp_rows()
+        except Exception:
+            rows = []
+        (folder / "earnings.json").write_text(json.dumps(rows, indent=1), encoding="utf-8")
+        print(f"Archive saved: {name}", flush=True)
+        return name
+
+    def archives(self) -> dict:
+        reports, raw = [], []
+        base = self.archive / "reports"
+        if base.exists():
+            for d in sorted(base.iterdir(), reverse=True):
+                if d.is_dir():
+                    size = sum(f.stat().st_size for f in d.iterdir() if f.is_file())
+                    reports.append({"name": d.name, "bytes": size, "t": d.stat().st_mtime})
+        for x in reversed(self.raw_index()):
+            f = self.archive / "raw" / x["file"]
+            if f.exists():
+                raw.append({**x, "bytes": f.stat().st_size})
+        live = self.out / "raw_updates.jsonl"
+        return {"reports": reports, "raw": raw, "raw_live_bytes": live.stat().st_size if live.exists() else 0,
+                "raw_keep_mb": RAW_KEEP_MB, "rotate_hours": RAW_ROTATE_HOURS}
+
+    def report_archive_zip(self, name: str) -> bytes | None:
+        folder = self.archive / "reports" / name
+        if not ARCHIVE_NAME.match(name) or not folder.is_dir():
+            return None
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in sorted(folder.iterdir()):
+                z.write(f, f"{name}/{f.name}")
+        return buf.getvalue()
+
+    def bundle(self) -> bytes:
+        """Everything Claude needs to review the run, without the heavy raw data (usually well under 5 MB)."""
+        if self.recorder and self.recorder.raw_fh and not self.recorder.raw_fh.closed:
+            self.recorder.raw_fh.flush()
+        stamp = f"{datetime.now(timezone.utc):%Y%m%d-%H%M}"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            try:
+                text = W.report(self.out)
+            except Exception as err:
+                text = f"Report could not be built: {type(err).__name__}: {err}"
+            z.writestr(f"orbit-{stamp}/report.txt", text)
+            for f in BUNDLE_FILES:
+                if (self.out / f).exists():
+                    z.write(self.out / f, f"orbit-{stamp}/{f}")
+            try:
+                snap = self.snapshot()
+            except Exception as err:
+                snap = {"error": f"{type(err).__name__}: {err}"}
+            snap.pop("logs", None)
+            z.writestr(f"orbit-{stamp}/state.json", redact(json.dumps(snap, indent=1, default=str)))
+            z.writestr(f"orbit-{stamp}/logs.txt", redact("\n".join(str(x) for x in list(self.logs))))
+            base = self.archive / "reports"
+            if base.exists():
+                for d in sorted(base.iterdir()):
+                    if (d / "report.txt").exists():
+                        z.write(d / "report.txt", f"orbit-{stamp}/previous_reports/{d.name}.txt")
+        return buf.getvalue()
+
+    # -- raw data: rotate, compress, cap ------------------------------------
+    def raw_index(self) -> list[dict]:
+        try:
+            return json.loads((self.archive / "raw" / "index.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+
+    def rotate_raw(self, wait: bool = False) -> None:
+        """Move the raw log aside and gzip it in the background, so the live file stays small."""
+        if not self.recorder:
+            return
+        moved = self.recorder.rotate_raw(self.archive / "raw")
+        self.raw_started = time.time()
+        if moved:
+            th = threading.Thread(target=self._compress_raw, args=(moved,), daemon=True)
+            th.start()
+            if wait:
+                th.join()
+
+    def _compress_raw(self, src: Path) -> None:
+        count, first, last = 0, None, None
+        gz = src.with_name(src.name + ".gz")
+        try:
+            with open(src, encoding="utf-8") as fin, W.gzip.open(gz, "wt", encoding="utf-8", compresslevel=6) as fout:
+                for line in fin:
+                    fout.write(line)
+                    try:
+                        t = json.loads(line)["t"]
+                    except (ValueError, KeyError):
+                        continue
+                    count += 1
+                    first = t if first is None else first
+                    last = t
+            src.unlink()
+        except OSError as e:
+            print(f"Raw archive: could not compress {src.name}: {e}", flush=True)
+            return
+        with self.raw_lock:
+            idx = self.raw_index()
+            idx.append({"file": gz.name, "updates": count, "from": first, "to": last,
+                        "hours": round((last - first) / 3600, 4) if count > 1 else 0.0})
+            total = sum((self.archive / "raw" / x["file"]).stat().st_size
+                        for x in idx if (self.archive / "raw" / x["file"]).exists())
+            while len(idx) > 1 and total > RAW_KEEP_MB * 1024 * 1024:
+                old = idx.pop(0)
+                f = self.archive / "raw" / old["file"]
+                if f.exists():
+                    total -= f.stat().st_size
+                    f.unlink()
+                print(f"Raw archive: removed oldest file {old['file']} to stay under {RAW_KEEP_MB:g} MB", flush=True)
+            tmp = self.archive / "raw" / "index.tmp"
+            tmp.write_text(json.dumps(idx), encoding="utf-8")
+            tmp.replace(self.archive / "raw" / "index.json")
+        print(f"Raw archive: {gz.name} saved ({gz.stat().st_size / 1e6:.1f} MB compressed)", flush=True)
 
     def audit_summary(self) -> dict:
         """Who closed the gaps and how accurate the price maths is (live worker, or the saved CSVs)."""
@@ -441,16 +612,14 @@ class App:
             asyncio.run_coroutine_threadsafe(self.restart(), self.loop).result(timeout=30)
 
     def maintain(self) -> None:
-        """Rotate the raw log at 200 MB (keep one old file); send the daily summary."""
+        """Compress the raw log every few hours (or at 64 MB) into archive/raw; send the daily summary."""
         if self.notifier.enabled and time.time() - self.last_daily >= 86400:
             self.last_daily = time.time()
             self.notifier.send("Orbit daily summary\n" + "\n".join(W.report(self.out).splitlines()[2:16]), force=True)
         raw = self.out / "raw_updates.jsonl"
-        if self.recorder and self.recorder.raw_fh and raw.exists() and raw.stat().st_size > RAW_ROTATE_BYTES:
-            self.recorder.raw_fh.close()
-            raw.replace(self.out / "raw_updates.1.jsonl")
-            self.recorder.raw_fh = open(raw, "a", encoding="utf-8")
-            print("Raw log rotated (kept one previous file).")
+        if self.recorder and self.recorder.raw_fh and raw.exists() and raw.stat().st_size > 0 and (
+                raw.stat().st_size > RAW_ROTATE_BYTES or time.time() - self.raw_started > RAW_ROTATE_HOURS * 3600):
+            self.rotate_raw()
 
     # -- auth -----------------------------------------------------------------
     def check_password(self, pw: str) -> bool:
@@ -677,6 +846,26 @@ def make_handler(app: App):
                 if app.recorder and app.recorder.raw_fh and not app.recorder.raw_fh.closed:
                     app.recorder.raw_fh.flush()
                 return self.send(200, W.report(app.out).encode(), "text/plain; charset=utf-8")
+            if path == "/api/archives":
+                return self.json(app.archives())
+            if path == "/download/bundle.zip":
+                data = app.bundle()
+                return self.send(200, data, "application/zip", {
+                    "Content-Disposition": f'attachment; filename="orbit-bundle-{time.strftime("%Y%m%d-%H%M", time.gmtime())}.zip"'})
+            if path.startswith("/download/archive/"):
+                parts = path.split("/")
+                kind, name = (parts[3], parts[4]) if len(parts) == 5 else ("", "")
+                if kind == "report" and ARCHIVE_NAME.match(name):
+                    data = app.report_archive_zip(name)
+                    if data:
+                        return self.send(200, data, "application/zip",
+                                         {"Content-Disposition": f'attachment; filename="orbit-{name}.zip"'})
+                if kind == "raw" and ARCHIVE_NAME.match(name) and name.endswith(".jsonl.gz"):
+                    f = app.archive / "raw" / name
+                    if f.is_file():
+                        return self.send(200, f.read_bytes(), "application/gzip",
+                                         {"Content-Disposition": f'attachment; filename="{name}"'})
+                return self.json({"error": "not found"}, 404)
             if path.startswith("/download/"):
                 name = path.rsplit("/", 1)[-1]
                 f = app.out / name
@@ -725,6 +914,8 @@ def make_handler(app: App):
                 if path == "/api/test-alert":
                     ok = app.notifier.send("Orbit: test alert. Alerts are working.", force=True)
                     return self.json({"ok": ok, "enabled": app.notifier.enabled})
+                if path == "/api/archive/save":
+                    return self.json({"ok": True, "name": app.save_archive("manual")})
                 if path == "/api/lp/reset":
                     return self.json({"ok": app.reset_earnings()})
                 if path == "/api/restart":

@@ -170,7 +170,20 @@ vaults would show gaps that are not real.
 
 - `dislocations.csv`: one row per profitable gap: which pools, when it opened, slots and seconds open, peak gap %, peak net profit, best trade size.
 - `shocks.csv`: one row per price jump, and whether a profitable gap was visible.
-- `raw_updates.jsonl`: every vault balance change (used by `replay`).
+- `raw_updates.jsonl`: every vault balance change (used by `replay`). Every 6 hours (or at 64 MB) it is moved to
+  `archive/raw/` and gzipped (about 7x smaller); the oldest compressed files go once they pass
+  `ORBIT_RAW_KEEP_MB` (default 1000). `replay --input` reads `.jsonl.gz` files directly.
+- `archive/reports/<time>-<why>/`: a copy of the report, CSVs and earnings, saved automatically before every
+  "Reset tracking" and whenever you press "Save a copy now".
+
+## Saved reports and the analysis bundle
+
+The dashboard's "Saved reports & data" section lists earlier reports and compressed raw files, each downloadable.
+"Download analysis bundle" gives one small zip (report, all CSVs, earnings, dashboard state, recent activity and
+every earlier report, but no raw data), with API keys and bot tokens masked. It is the file to share for a review.
+
+Per-day figures and "days to break even" read "too early" until a position has 1 hour of data, and a pace that
+would take more than a year to pay back reads "never at this pace".
 
 ## Honest limits
 

@@ -826,6 +826,30 @@ class PoolEarningsTests(unittest.TestCase):
         self.assertEqual(sim.fee_quote, 0.0)
         self.assertEqual(sim.result()["skipped_updates"], 1)
 
+    def test_per_day_figures_wait_for_an_hour_of_data(self):
+        p = self.pool()
+        sim = W.LpSim(p, 0.05, 0.0)
+        p.fg = (0, self.per_unit(sim, 0.2))
+        sim.observe(600.0)                           # 10 minutes in
+        r = sim.result()
+        self.assertTrue(r["early"])
+        self.assertIsNone(r["days_to_break_even"])
+        self.assertIn("too early", "\n".join(W.lp_report_rows([("X", r)])))
+        p.fg = (0, self.per_unit(sim, 0.4))
+        sim.observe(7200.0)
+        r = sim.result()
+        self.assertFalse(r["early"])
+        self.assertIsNotNone(r["days_to_break_even"])
+
+    def test_tiny_pace_counts_as_never(self):
+        p = self.pool()
+        sim = W.LpSim(p, 0.05, 0.0)
+        p.fg = (0, self.per_unit(sim, 5e-4))          # almost nothing earned in a day
+        sim.observe(86400.0)
+        r = sim.result()
+        self.assertGreater(r["net_sol_per_day"], 0)
+        self.assertIsNone(r["days_to_break_even"])
+
     def test_same_slot_is_not_counted_twice(self):
         p = self.pool()
         sim = W.LpSim(p, 0.05, 0.0)
@@ -1025,6 +1049,21 @@ class FakeAuditRpc:
         raise RuntimeError(method)
 
 
+class VersionedRpc:
+    """Refuses version-0 lookups the way Helius does, then answers."""
+    def __init__(self):
+        self.versions = []
+
+    def call(self, method, params):
+        v = params[1]["maxSupportedTransactionVersion"]
+        self.versions.append(v)
+        if v < 2:
+            raise RuntimeError('RPC error: Transaction version (2) is not supported by the requesting client. '
+                               'Please try the request again with the following configuration parameter: '
+                               '"maxSupportedTransactionVersion": 2')
+        return None
+
+
 class NewFeatureTests(TempDirCase):
     """DAMM v2 pools, triangle loops, and reading real transactions (who closed a gap, reality check)."""
 
@@ -1032,6 +1071,25 @@ class NewFeatureTests(TempDirCase):
         rec = W.Recorder(self.dir)
         self.addCleanup(rec.close)
         return W.Engine(cfg, rec)
+
+    def test_auditor_asks_for_new_transaction_versions(self):
+        self.assertGreaterEqual(W.TX_VERSION, 1)
+        e = self.engine({"watches": []})
+        rpc = VersionedRpc()
+        aud = W.Auditor(e, rpc, self.dir, pause=0)
+        self.addCleanup(aud.close)
+        aud._tx("sig")
+        self.assertEqual(rpc.versions, [W.TX_VERSION, 2])        # retried once with what the node asked for
+
+    def test_compressed_raw_files_replay_and_count(self):
+        import gzip
+        raw = self.dir / "r.jsonl.gz"
+        with gzip.open(raw, "wt", encoding="utf-8") as fh:
+            fh.write('{"t": 0, "v": "a", "s": 1, "a": 5}\n{"t": 3600, "v": "a", "s": 2, "a": 6}\n')
+        self.assertEqual(W.raw_span(raw), (2, 1.0))
+        (self.dir / "archive" / "raw").mkdir(parents=True)
+        (self.dir / "archive" / "raw" / "index.json").write_text('[{"file": "r.jsonl.gz", "updates": 2, "hours": 1.0}]')
+        self.assertIn("Observed: 1.00 hours, 2 pool updates.", W.report(self.dir))
 
     # -- DAMM v2 ---------------------------------------------------------------------------------
     def test_damm2_prices_both_orientations_and_reads_counters(self):
