@@ -5,7 +5,7 @@ Two parts:
 
 1. Crypto regime (0-100). The six scoring components and the composite come unchanged from the
    crypto-regime-analyzer skill in github.com/tradermonty/claude-trading-skills (MIT licence,
-   copyright 2026 TraderMonty; see regime_skill/NOTICE). Only the data fetching is rewritten here,
+   copyright 2026 TraderMonty; see regime_skill.py). Only the data fetching is rewritten here,
    using Python's standard library so Orbit still needs no pip installs.
 
 2. Solana "LP weather" (Orbit's own addition). For every token you watch, how often did its price
@@ -32,7 +32,9 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "regime_skill"))
+import regime_skill  # noqa: E402  (the skill's scoring code, in one file)
+
+regime_skill.install()
 
 from calculators.alt_breadth_calculator import calculate_alt_breadth          # noqa: E402
 from calculators.btc_trend_calculator import calculate_btc_trend              # noqa: E402

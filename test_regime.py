@@ -165,7 +165,13 @@ class MoodTests(unittest.TestCase):
 
     def test_vendored_scoring_is_the_skills_own(self):
         self.assertEqual(sum(R.COMPONENT_WEIGHTS.values()), 1.0)
-        self.assertTrue((Path(R.__file__).parent / "regime_skill" / "NOTICE").exists())
+        import regime_skill
+        up = Path("/tmp/claude-0/-home-claude/2033b762-bf82-5962-a954-4059d8a56af0/scratchpad/repos/cts/skills/"
+                  "crypto-regime-analyzer/scripts")
+        if up.exists():                                   # word-for-word copy of the skill's code
+            self.assertEqual(regime_skill.SOURCES["scorer"], (up / "scorer.py").read_text())
+            for f in (up / "calculators").glob("*_calculator.py"):
+                self.assertEqual(regime_skill.SOURCES[f"calculators.{f.stem}"], f.read_text())
 
 
 if __name__ == "__main__":

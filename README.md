@@ -180,7 +180,7 @@ vaults would show gaps that are not real.
 
 A background job (every 6 hours) scores the crypto market from 0 (risk-off) to 100 (risk-on) using the six
 components of the crypto-regime-analyzer skill from github.com/tradermonty/claude-trading-skills (MIT; the scoring
-files are copied unchanged into `regime_skill/`, with the licence in `regime_skill/NOTICE`). Orbit fetches the data
+files are kept word for word inside `regime_skill.py`, with the licence at its top). Orbit fetches the data
 itself with the standard library: CoinGecko's free API, plus funding from Binance or, if Binance blocks the server's
 region, OKX. BTC dominance needs 31 days of daily readings before it counts; until then its weight is shared out.
 
