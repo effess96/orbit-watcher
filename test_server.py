@@ -388,6 +388,15 @@ class Helpers(unittest.TestCase):
         self.assertNotIn("SECRET123", text)
         self.assertNotIn("ABCdef", text)
 
+    def test_gap_lookups_survive_a_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            app = S.App(Path(d), PASSWORD)
+            app.out.mkdir(parents=True, exist_ok=True)
+            (app.out / "closers.csv").write_text(
+                "signature,signer,touched_both_pools,jito_tip_sol,total_cost_sol\nabc,S1,True,0.00001,0.00002\n")
+            a = app.audit_summary()
+            self.assertEqual((a["closers_found"], a["by_arbitrage_bots"]), (1, 1))    # read from the saved file
+
     def test_refuses_short_password(self):
         import os
         from unittest.mock import patch

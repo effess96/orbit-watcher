@@ -189,6 +189,7 @@ class App:
         self.last_hunt = 0.0
         self.history: collections.deque = collections.deque(maxlen=720)   # 1 hour at 5-second samples
         self._rates = {"t": 0.0}
+        self._audit_cache: tuple = (0.0, [], [])
         self.archive = self.out / "archive"
         self.raw_started = time.time()
         self.raw_lock = threading.Lock()
@@ -362,7 +363,7 @@ class App:
         with open(self.out / "regime_log.jsonl", "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"t": result["t"], "score": c.get("score"), "zone": c.get("zone"),
                                  "sol": result["sol"].get("price"), "sol_vol30": result["sol"].get("vol30"),
-                                 "weather": {t["watch"]: t["weather"] for t in result["tokens"]}}) + "\n")
+                                 "weather": {t["watch"]: [t["weather_5"], t["weather_20"]] for t in result["tokens"]}}) + "\n")
         self.mood_status.update(state="ok", error="")
         print(f"Market mood: {c.get('zone')} (score {c.get('score')}/100); "
               f"{result['requests']} requests in {result['seconds']} s", flush=True)
@@ -519,9 +520,12 @@ class App:
 
     def audit_summary(self) -> dict:
         """Who closed the gaps and how accurate the price maths is (live worker, or the saved CSVs)."""
-        if self.auditor:
-            return self.auditor.summary()
-        return W.summarise_audit(W.read_csv(self.out / "closers.csv"), W.read_csv(self.out / "quote_checks.csv"))
+        # always from the saved files, so a restart doesn't wipe the counts; live worker adds its counters
+        if time.time() - self._audit_cache[0] > 30:
+            self._audit_cache = (time.time(), W.read_csv(self.out / "closers.csv"),
+                                 W.read_csv(self.out / "quote_checks.csv"))
+        _, closers, checks = self._audit_cache
+        return W.summarise_audit(closers, checks, dict(self.auditor.stats) if self.auditor else None)
 
     def loop_state(self) -> dict:
         e = self.engine

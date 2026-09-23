@@ -2035,18 +2035,21 @@ def mood_report(folder: Path) -> list[str]:
         out.append(f"  SOL: ${sol['price']:,.2f}; 30-day change {sol.get('change_30d_pct')}%; 30-day volatility "
                    f"{sol.get('vol30')}%/yr; trend: {sol.get('signal')}")
     out.append("  LP weather (last 90 days, daily closes; % of windows the price stayed inside the range):")
-    out.append("  token | vs | 3 days +/-5% | 3 days +/-20% | 7 days +/-5% | 7 days +/-20% | typical 7-day move | weather")
+    out.append("  token | vs | 3 days +/-5% | 3 days +/-20% | 7 days +/-5% | 7 days +/-20% | typical 7-day move | "
+               "+/-5% weather | +/-20% weather")
     for t in m.get("tokens", []):
         for vs in ("sol", "usd"):
             w = t.get(f"vs_{vs}")
             if w:
                 out.append(f"  {t['watch']} | {vs.upper()} | {w['in_3d_5']:.0f}% | {w['in_3d_20']:.0f}% | "
-                           f"{w['in_7d_5']:.0f}% | {w['in_7d_20']:.0f}% | {w['median_move_7d']:.1f}% | {t['weather']}")
+                           f"{w['in_7d_5']:.0f}% | {w['in_7d_20']:.0f}% | {w['median_move_7d']:.1f}% | "
+                           f"{w.get('weather_5', '?')} | {w.get('weather_20', t.get('weather', '?'))}")
         if not (t.get("vs_sol") or t.get("vs_usd")):
             out.append(f"  {t['watch']} | - | {t.get('note') or 'no data'}")
-    out.append("  'Calm' = stayed within +/-20% over 90%+ of 3-day windows: a range position there mostly keeps "
-               "earning fees. 'Stormy' = under 70%: price moves are likely to beat the fees. Daily closes hide "
-               "intraday swings, so real figures are a little worse.")
+    out.append("  Weather is judged per range on 3-day windows: 'calm' = price stayed inside 80%+ of the time (the "
+               "position mostly keeps earning fees), 'choppy' = 50-80%, 'stormy' = under 50% (it is often pushed out "
+               "of range and price moves tend to beat the fees). Daily closes hide intraday swings, so real figures "
+               "are a little worse.")
     return out + [""]
 
 

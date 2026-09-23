@@ -47,7 +47,7 @@ from scorer import COMPONENT_LABELS, COMPONENT_WEIGHTS, calculate_composite_scor
 COINGECKO = "https://api.coingecko.com/api/v3"
 BINANCE_FUNDING = "https://fapi.binance.com/fapi/v1/premiumIndex"
 OKX_FUNDING = "https://www.okx.com/api/v5/public/funding-rate?instId={sym}-USDT-SWAP"
-USER_AGENT = "orbit-watcher/1.3 (read-only research)"
+USER_AGENT = "orbit-watcher/1.3.1 (read-only research)"
 REQUEST_DELAY_S = 8.0          # CoinGecko's free tier allows roughly 5-15 requests a minute
 MAX_RETRIES = 4
 BACKOFF_BASE_S = 15
@@ -277,12 +277,15 @@ def ratio(a: list[float], b: list[float]) -> list[float]:
     return [x / y for x, y in zip(a[-n:], b[-n:]) if y > 0]
 
 
-def lp_weather_label(w: dict | None) -> str:
-    """Plain words for the +/-20%, 3-day figure (the setting Orbit's 72-hour test uses)."""
-    if not w:
+CALM_PCT, CHOPPY_PCT = 80, 50
+
+
+def lp_weather_label(w: dict | None, band: int = 20) -> str:
+    """Plain words for one range over 3 days (Orbit's 72-hour test): calm 80%+, choppy 50-80%, stormy under 50%."""
+    if not w or f"in_3d_{band}" not in w:
         return "unknown"
-    x = w.get("in_3d_20", 0)
-    return "calm" if x >= 90 else "choppy" if x >= 70 else "stormy"
+    x = w[f"in_3d_{band}"]
+    return "calm" if x >= CALM_PCT else "choppy" if x >= CHOPPY_PCT else "stormy"
 
 
 def analyse(data: RegimeData, watches: list[dict]) -> dict:
@@ -337,7 +340,10 @@ def analyse(data: RegimeData, watches: list[dict]) -> dict:
         elif not row["note"]:
             row["note"] = "not listed on CoinGecko"
         main = row["vs_sol"] or row["vs_usd"]
-        row["weather"] = lp_weather_label(main)
+        row["weather_5"], row["weather_20"] = lp_weather_label(main, 5), lp_weather_label(main, 20)
+        for vs in ("vs_sol", "vs_usd"):
+            if row[vs]:
+                row[vs]["weather_5"], row[vs]["weather_20"] = lp_weather_label(row[vs], 5), lp_weather_label(row[vs], 20)
         tokens.append(row)
 
     comps = {cid: {"label": COMPONENT_LABELS[cid], "weight": COMPONENT_WEIGHTS[cid],

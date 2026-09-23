@@ -95,12 +95,13 @@ class MoodTests(unittest.TestCase):
         self.assertTrue(m["components"]["funding"]["data_available"])
         self.assertAlmostEqual(m["sol"]["price"], round(web.hist["solana"][-1], 2))
         rows = {t["watch"]: t for t in m["tokens"]}
-        self.assertEqual(rows["Bonk"]["weather"], "calm")
-        self.assertEqual(rows["$WIF"]["weather"], "stormy")
+        self.assertEqual((rows["Bonk"]["weather_5"], rows["Bonk"]["weather_20"]), ("calm", "calm"))
+        self.assertEqual((rows["$WIF"]["weather_5"], rows["$WIF"]["weather_20"]), ("stormy", "stormy"))
+        self.assertEqual(rows["Bonk"]["vs_sol"]["weather_5"], "calm")
         self.assertIsNotNone(rows["Bonk"]["vs_usd"])                     # it has a USDC pool too
         self.assertIsNone(rows["$WIF"]["vs_usd"])
         self.assertEqual(rows["NEW"]["note"], "not listed on CoinGecko")
-        self.assertEqual(rows["NEW"]["weather"], "unknown")
+        self.assertEqual(rows["NEW"]["weather_5"], "unknown")
 
     def test_second_run_same_day_uses_the_cache(self):
         web = FakeWeb()
@@ -129,8 +130,11 @@ class MoodTests(unittest.TestCase):
         self.assertEqual(w["in_3d_20"], 100.0)
         self.assertIsNone(R.range_weather([1.0] * 5))
         self.assertEqual(R.lp_weather_label({"in_3d_20": 95}), "calm")
-        self.assertEqual(R.lp_weather_label({"in_3d_20": 80}), "choppy")
-        self.assertEqual(R.lp_weather_label({"in_3d_20": 50}), "stormy")
+        self.assertEqual(R.lp_weather_label({"in_3d_20": 70}), "choppy")
+        self.assertEqual(R.lp_weather_label({"in_3d_20": 40}), "stormy")
+        # real readings from the first live run: Bonk vs SOL was 35% at +/-5% and 97% at +/-20%
+        live = {"in_3d_5": 35, "in_3d_20": 97}
+        self.assertEqual((R.lp_weather_label(live, 5), R.lp_weather_label(live, 20)), ("stormy", "calm"))
 
     def test_dominance_history_turns_on_after_31_days(self):
         d = self.data(FakeWeb())

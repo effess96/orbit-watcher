@@ -149,10 +149,10 @@ section,.watch{min-width:0}
     </div>
     <h3>LP weather: how often each token's price stayed inside the range (last 90 days)</h3>
     <div class="scroll"><table><thead><tr><th>Token</th><th>Against</th><th>3 days ±5%</th><th>3 days ±20%</th>
-      <th>7 days ±5%</th><th>7 days ±20%</th><th>Typical 7-day move</th><th>Weather</th></tr></thead><tbody id="mood-weather"></tbody></table></div>
+      <th>7 days ±5%</th><th>7 days ±20%</th><th>Typical 7-day move</th><th>±5% weather</th><th>±20% weather</th></tr></thead><tbody id="mood-weather"></tbody></table></div>
     <div id="mood-weather-empty" class="empty">The first reading arrives about 5–7 minutes after Orbit starts (CoinGecko's free tier is slow on purpose).</div>
     <p class="note">Describes the market; it is not a buy or sell signal. Regime scoring comes from the crypto-regime-analyzer skill (tradermonty, MIT licence).
-      "Calm" means the price stayed within ±20% over 90%+ of 3-day stretches, so a range position there mostly keeps earning fees; "stormy" means under 70%, where price moves tend to beat the fees.
+      Weather is judged separately for each range over 3-day stretches: "calm" = the price stayed inside 80%+ of the time, so the position mostly keeps earning fees; "choppy" = 50–80%; "stormy" = under 50%, where it is often pushed out of range and price moves tend to beat the fees.
       Daily closes hide intraday swings, so real figures are a little worse. Refreshes every 6 hours; you get a Telegram alert when the regime changes zone.</p>
   </section>
 
@@ -658,15 +658,16 @@ function renderMood(s) {
     el("div", {class: "note", text: sol.signal || ""}));
   const rows = [];
   for (const t of m.tokens || []) {
-    for (const vs of ["sol", "usd"]) if (t["vs_" + vs]) rows.push({...t["vs_" + vs], watch: t.watch, vs: vs.toUpperCase(), weather: t.weather});
-    if (!t.vs_sol && !t.vs_usd) rows.push({watch: t.watch, vs: "–", note: t.note, weather: t.weather});
+    for (const vs of ["sol", "usd"]) if (t["vs_" + vs]) rows.push({...t["vs_" + vs], watch: t.watch, vs: vs.toUpperCase()});
+    if (!t.vs_sol && !t.vs_usd) rows.push({watch: t.watch, vs: "–", note: t.note});
   }
-  const p = v => v === undefined ? "–" : el("span", {class: v >= 90 ? "pos" : v < 70 ? "neg" : "", text: fmt(v, 0) + "%"});
+  const p = v => v === undefined ? "–" : el("span", {class: v >= 80 ? "pos" : v < 50 ? "neg" : "", text: fmt(v, 0) + "%"});
   const W = {calm: good, choppy: warn, stormy: bad};
+  const wx = w => { const b = el("b", {text: w || "unknown"}); b.style.color = W[w] || ""; return b; };
   renderTable("mood-weather", "mood-weather-empty", rows, r => r.note !== undefined && r.in_3d_5 === undefined
-    ? [r.watch, "–", r.note, "", "", "", "", "unknown"]
+    ? [r.watch, "–", r.note, "", "", "", "", "unknown", "unknown"]
     : [r.watch, r.vs, p(r.in_3d_5), p(r.in_3d_20), p(r.in_7d_5), p(r.in_7d_20), `${fmt(r.median_move_7d, 1)}%`,
-       (() => { const b = el("b", {text: r.weather}); b.style.color = W[r.weather] || ""; return b; })()]);
+       wx(r.weather_5), wx(r.weather_20)]);
   const ago = Math.max(0, Date.now() / 1000 - m.t);
   $("mood-age").textContent = `updated ${ago < 3600 ? Math.round(ago / 60) + " min" : fmt(ago / 3600, 1) + " h"} ago · funding from ${m.funding_source}`
     + ` · dominance history ${Math.min(m.dominance_days, 31)}/31 days`;
