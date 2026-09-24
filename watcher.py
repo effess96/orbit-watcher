@@ -2302,7 +2302,8 @@ def lp_spread(results: list[dict]) -> dict:
             out[key] = {"n": len(rr), "ahead": sum(r["net_vs_hold_pct"] > 0 for r in rr),
                         "avg_net_pct": round(statistics.mean(r["net_vs_hold_pct"] for r in rr), 3),
                         "avg_sol_per_day": round(statistics.mean(r.get("net_sol_per_day", 0) for r in rr), 5),
-                        "avg_vs_quote_pct": round(statistics.mean(r.get("vs_quote_pct", 0) for r in rr), 3)}
+                        "avg_vs_quote_pct": round(statistics.mean(r.get("vs_quote_pct", 0) for r in rr), 3),
+                        "hours": round(max(r.get("hours", 0) for r in rr), 2)}
     return out
 
 

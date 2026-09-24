@@ -787,6 +787,7 @@ class App:
             "latency": e.latency_stats() if e else None,
             "lp": (lp := self.lp_rows()),
             "lp_spread": W.lp_spread(lp),
+            "capital_sol": W.LP_CAPITAL_SOL,
             "verdict": W.lp_verdict(lp)[1:],
             "mood": self.mood, "mood_status": self.mood_status,
             "audit": self.audit_summary(),
@@ -1054,7 +1055,10 @@ h1{{font-size:20px;margin:0 0 4px;letter-spacing:.08em}} p{{color:#8b9bb0;margin
 input{{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #2b3b4f;
 background:#0b1016;color:#e6edf3;font-size:15px}} button{{margin-top:14px;width:100%;padding:12px;border:0;
 border-radius:8px;background:#3ddc97;color:#06281a;font-weight:600;font-size:15px;cursor:pointer}}
-.err{{color:#ff7b72;margin:12px 0 0}}</style></head><body>
+.err{{color:#ff7b72;margin:12px 0 0}}
+@media (prefers-color-scheme: light){{body{{background:#f4f5f7;color:#131820}}form{{background:#fff;border-color:#e4e7ec;
+box-shadow:0 1px 3px rgba(16,24,40,.08)}}p{{color:#5b6472}}input{{background:#f8f9fb;border-color:#d3d8e0;color:#131820}}
+button{{background:#11875a;color:#fff}}.err{{color:#c42b2b}}}}</style></head><body>
 <form method="post" action="/login"><h1>ORBIT</h1><p>Private dislocation watcher</p>
 <input type="password" name="password" placeholder="Password" autofocus required autocomplete="current-password">
 <button>Sign in</button>{msg}</form></body></html>""".encode()

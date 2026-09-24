@@ -4,8 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Orbit Watcher</title>
+<script nonce="{{NONCE}}">try{const t=localStorage.getItem("orbit-theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
 <style nonce="{{NONCE}}">
-:root{--bg:#0b1016;--panel:#121a23;--line:#223041;--text:#e6edf3;--muted:#8b9bb0;--green:#3ddc97;--red:#ff7b72;--amber:#e3b341;--blue:#79c0ff}
+/* ---- theme tokens: light default, dark via OS setting or the toggle ---- */
+:root{color-scheme:light;
+--bg:#f4f5f7;--panel:#ffffff;--panel-2:#f8f9fb;--line:#e4e7ec;--line-2:#d3d8e0;--text:#131820;--muted:#5b6472;
+--pos:#0e7f3f;--neg:#c42b2b;--link:#1d6bcc;--track:#e8ecf1;--grid:#e7e9ed;--axis:#c3c9d2;--btn:#f0f2f5;--btn-h:#e5e8ed;
+--primary:#11875a;--on-primary:#ffffff;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.07);
+--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#4a3aa7;--s8:#e34948;
+--good:#0ca30c;--warning:#fab219;--critical:#d03b3b;--green:var(--pos);--red:var(--neg);--amber:#b7791f;--blue:var(--link)}
+@media (prefers-color-scheme: dark){:root:where(:not([data-theme="light"])){color-scheme:dark;
+--bg:#0b0f14;--panel:#121820;--panel-2:#0e131a;--line:#222b36;--line-2:#2e3947;--text:#e7ecf2;--muted:#8e98a6;
+--pos:#3ddc97;--neg:#ff7b72;--link:#79c0ff;--track:#1b2330;--grid:#232b35;--axis:#36404d;--btn:#1a2230;--btn-h:#232d3c;
+--primary:#3ddc97;--on-primary:#06281a;--shadow:none;
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--amber:#e3b341}}
+:root[data-theme="dark"]{color-scheme:dark;
+--bg:#0b0f14;--panel:#121820;--panel-2:#0e131a;--line:#222b36;--line-2:#2e3947;--text:#e7ecf2;--muted:#8e98a6;
+--pos:#3ddc97;--neg:#ff7b72;--link:#79c0ff;--track:#1b2330;--grid:#232b35;--axis:#36404d;--btn:#1a2230;--btn-h:#232d3c;
+--primary:#3ddc97;--on-primary:#06281a;--shadow:none;
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--amber:#e3b341}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 header{display:flex;align-items:center;gap:14px;padding:16px 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
@@ -13,14 +30,14 @@ header h1{font-size:18px;letter-spacing:.14em;margin:0}
 header .sub{color:var(--muted);letter-spacing:.06em;font-size:12px}
 .spacer{flex:1}
 .pill{padding:3px 10px;border-radius:99px;font-size:12px;border:1px solid var(--line);color:var(--muted)}
-.pill.ok{color:var(--green);border-color:#1f5c43}.pill.warn{color:var(--amber);border-color:#5c4a1f}
+.pill.ok{color:var(--pos);border-color:color-mix(in srgb,var(--pos) 45%,transparent);background:color-mix(in srgb,var(--pos) 9%,transparent)}.pill.warn{color:var(--amber);border-color:color-mix(in srgb,var(--amber) 45%,transparent)}
 .tabbar{position:sticky;top:0;z-index:5;display:flex;gap:4px;flex-wrap:wrap;background:var(--bg);padding:10px 0 12px;margin-bottom:6px;border-bottom:1px solid var(--line)}
 .tabbar button{background:transparent;border:1px solid transparent;color:var(--muted);font-weight:600;padding:8px 14px}
 .tabbar button.on{background:var(--panel);border-color:var(--line);color:var(--text)}
 .tab{display:none}.tab.on{display:block}
 #verdict div,#health div{margin:6px 0;font-size:13px}#verdict .res{font-weight:600;margin-top:10px}
 main{max-width:1200px;margin:0 auto;padding:20px 16px 60px}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:12px;margin-bottom:20px}
 .tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
 .tile .k{color:var(--muted);font-size:12px}.tile .v{font-size:24px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
 section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:18px}
@@ -31,16 +48,16 @@ th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);white-
 th{color:var(--muted);font-weight:500;font-size:12px}
 .scroll{overflow-x:auto}
 input,button{font:inherit}
-input[type=text],input[type=number]{background:var(--bg);border:1px solid #2b3b4f;color:var(--text);border-radius:7px;padding:7px 9px}
+input[type=text],input[type=number]{background:var(--bg);border:1px solid var(--line-2);color:var(--text);border-radius:7px;padding:7px 9px}
 input[type=number]{width:110px}
 #mint{flex:1 1 260px;min-width:0;max-width:520px}
-button{background:#1c2733;color:var(--text);border:1px solid #2b3b4f;border-radius:7px;padding:7px 12px;cursor:pointer}
-button:hover{border-color:#3d526b}
-button.primary{background:var(--green);color:#06281a;border-color:var(--green);font-weight:600}
+button{background:var(--btn);color:var(--text);border:1px solid var(--line-2);border-radius:7px;padding:7px 12px;cursor:pointer}
+button:hover{border-color:var(--axis);background:var(--btn-h)}
+button.primary{background:var(--primary);color:var(--on-primary);border-color:var(--primary);font-weight:600}
 button.danger{color:var(--red)}
-a.btn{display:inline-block;background:var(--green);color:#06281a;border-radius:7px;padding:7px 12px;font-weight:600;font-size:14px;text-decoration:none;letter-spacing:0}
-.muted{color:var(--muted,#8b9bb0)}
-section h3{font-size:13px;margin:12px 0 6px;color:#8b9bb0;font-weight:600}
+a.btn{display:inline-block;background:var(--primary);color:var(--on-primary);border-radius:7px;padding:7px 12px;font-weight:600;font-size:14px;text-decoration:none;letter-spacing:0}
+.muted{color:var(--muted)}
+section h3{font-size:13px;margin:12px 0 6px;color:var(--muted);font-weight:600}
 button:disabled{opacity:.5;cursor:wait}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .watch{border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
@@ -55,8 +72,6 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 a{color:var(--blue)}
 .empty{color:var(--muted);padding:10px 0}
 .mt{margin-top:10px}
-:root{--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;
---good:#0ca30c;--warning:#fab219;--critical:#d03b3b;--grid:#2c2c2a;--axis:#383835;--muted:#898781;--track:#1d2a3a}
 .gauge .big{font-size:28px;font-weight:600;margin:6px 0}
 .gauges{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
 .gauge{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
@@ -70,7 +85,7 @@ a{color:var(--blue)}
 .meter .fill{height:100%;border-radius:5px;background:var(--s1)}
 .chart{position:relative}.chart svg{display:block;width:100%}
 .controls{gap:14px;flex-wrap:wrap;margin-bottom:8px;font-size:13px;color:var(--muted)}
-.controls select{margin-left:6px;background:var(--bg,#0b1016);color:var(--text);border:1px solid var(--axis);border-radius:6px;padding:4px 8px;font:inherit}.controls .chk{display:flex;align-items:center;gap:6px}
+.controls select{margin-left:6px;background:var(--panel-2);color:var(--text);border:1px solid var(--axis);border-radius:6px;padding:4px 8px;font:inherit}.controls .chk{display:flex;align-items:center;gap:6px}
 table.sortable th[data-k]{cursor:pointer;user-select:none;white-space:nowrap}
 table.sortable th[data-k]:hover{color:var(--text)}
 table.sortable th.sorted::after{content:" ▾"}table.sortable th.sorted.asc::after{content:" ▴"}
@@ -91,12 +106,35 @@ tr.grp td{background:var(--track);font-weight:600;color:var(--text)}
 .legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--muted);margin-bottom:6px}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
 .legend b{color:var(--text);font-weight:500;margin-left:4px}
-.tip{position:absolute;pointer-events:none;background:#0b1016;border:1px solid #2b3b4f;border-radius:8px;padding:8px 10px;
+.tip{position:absolute;pointer-events:none;background:var(--panel);box-shadow:0 4px 14px rgba(0,0,0,.18);border:1px solid var(--line-2);border-radius:8px;padding:8px 10px;
 font-size:12px;display:none;white-space:nowrap;z-index:2}.tip div{display:flex;align-items:center;gap:6px}
 .tip i{display:inline-block;width:8px;height:8px;border-radius:2px}
 .two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}
 section,.watch{min-width:0}
 @media(max-width:900px){.two{grid-template-columns:1fr}}
+
+/* ---- polish ---- */
+body{-webkit-font-smoothing:antialiased;transition:background .2s,color .2s}
+header{background:var(--panel);box-shadow:var(--shadow)}
+header h1{font-weight:800}
+section,.tile{box-shadow:var(--shadow);border-radius:14px}
+section h2{font-size:15.5px;font-weight:650;letter-spacing:-.005em;flex-wrap:wrap;row-gap:2px}
+.tile{min-width:0;padding:12px 14px}#t-slot{font-size:15px;white-space:nowrap;overflow-wrap:normal;padding-top:5px}.tile .v{font-size:clamp(17px,1.8vw,22px);letter-spacing:-.01em;overflow-wrap:anywhere}
+.gauge{background:var(--panel-2);border-radius:12px}
+.tabbar{background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px)}
+.tabbar button{border-radius:9px}
+.tabbar button:hover{color:var(--text);background:var(--btn)}
+.tabbar button.on{box-shadow:var(--shadow)}
+th{text-transform:uppercase;font-size:11px;letter-spacing:.04em}
+tbody tr:hover td{background:var(--panel-2)}
+#theme{min-width:92px}
+.money{display:grid;grid-template-columns:minmax(220px,1fr) 2fr;gap:18px;align-items:start}
+.money .cap .k{color:var(--muted);font-size:12px}.money .cap .v{font-size:30px;font-weight:700;letter-spacing:-.01em}
+.money .cap .sub{color:var(--muted);font-size:13px}
+.money .say{font-size:15px;line-height:1.55;margin:0 0 10px}
+.money table td,.money table th{padding:8px 10px}
+.money .amt{font-weight:650}
+@media (max-width:760px){.money{grid-template-columns:1fr}header{padding:12px 16px}}
 </style>
 </head>
 <body>
@@ -106,6 +144,7 @@ section,.watch{min-width:0}
   <span id="state" class="pill">…</span>
   <span id="rpc" class="pill">RPC</span>
   <span id="alertpill" class="pill">alerts off</span>
+  <button id="theme" title="Colour theme">◐ Auto</button>
   <button id="logout">Log out</button>
 </header>
 <main>
@@ -121,6 +160,17 @@ section,.watch{min-width:0}
     <div class="tile"><div class="k">Tradable after depth check</div><div class="v" id="t-trad">–</div></div>
     <div class="tile"><div class="k">Behind chain tip (median)</div><div class="v" id="t-lag">–</div></div>
   </div>
+
+  <section>
+    <h2>Your money <span class="note">paper test: no real money has moved</span></h2>
+    <div class="money">
+      <div class="cap"><div class="k">Your capital</div><div class="v" id="cap-sol">–</div><div class="sub" id="cap-usd"></div></div>
+      <div><p class="say" id="money-say">Waiting for an hour of data…</p>
+        <div class="scroll"><table><thead><tr><th>If you had put it all into…</th><th>It would be worth now</th><th>Earned / lost</th><th>vs just holding the coins</th></tr></thead><tbody id="money-rows"></tbody></table></div><div id="money-empty" class="empty"></div>
+      </div>
+    </div>
+    <p class="note" id="money-note"></p>
+  </section>
 
   <section>
     <h2>Test status</h2>
@@ -536,7 +586,8 @@ function renderTable(body, empty, rows, cells) {
 
 const SVGNS = "http://www.w3.org/2000/svg";
 const sv = (tag, attrs = {}) => { const n = document.createElementNS(SVGNS, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); return n; };
-const SERIES = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"].map(v => getComputedStyle(document.documentElement).getPropertyValue(v).trim());
+const readSeries = () => ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"].map(v => getComputedStyle(document.documentElement).getPropertyValue(v).trim());
+let SERIES = readSeries();
 const cssv = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const hhmm = t => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 
@@ -593,7 +644,7 @@ function lineChart(host, series, opts = {}) {
     svg.append(sv("path", {d: s.pts.map((p, i) => `${i ? "L" : "M"}${X(p[0])} ${Y(p[1])}`).join(" "), stroke: s.color, "stroke-width": 2, fill: "none", "stroke-linejoin": "round"}));
   }
   const cross = sv("line", {y1: m.t, y2: H - m.b, stroke: cssv("--muted"), "stroke-width": 1, visibility: "hidden"});
-  const dots = series.map(s => { const c = sv("circle", {r: 4, fill: s.color, stroke: "#121a23", "stroke-width": 2, visibility: "hidden"}); svg.append(c); return c; });
+  const dots = series.map(s => { const c = sv("circle", {r: 4, fill: s.color, stroke: cssv("--panel"), "stroke-width": 2, visibility: "hidden"}); svg.append(c); return c; });
   svg.append(cross);
   const tip = el("div", {class: "tip"});
   const overlay = sv("rect", {x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent"});
@@ -668,6 +719,33 @@ function bars(host, rows, emptyText) {
   }));
 }
 
+function renderMoney(s) {
+  const cap = s.capital_sol || 2.5, px = s.mood && s.mood.sol ? s.mood.sol.price : null, sp = s.lp_spread || {};
+  const usd = sol => px ? ` (≈ $${fmt(Math.abs(sol) * px, 2)})` : "";
+  $("cap-sol").textContent = `${fmt(cap, 4)} SOL`;
+  $("cap-usd").textContent = px ? `≈ $${fmt(cap * px, 2)} at SOL $${fmt(px, 2)}` : "";
+  const NAME = {"20": "Every ±20% position, split evenly", "5": "Every ±5% position, split evenly", "5 auto": "Every ±5% auto-rebalancing position"};
+  const rows = [];
+  for (const k of ["20", "5", "5 auto"]) { const v = sp[k]; if (!v) continue;
+    const pct = v.avg_vs_quote_pct ?? v.avg_net_pct, sol = cap * pct / 100, vs = cap * v.avg_net_pct / 100;
+    rows.push({k, v, pct, sol, vs}); }
+  const sign = x => (x >= 0 ? "+" : "−") + fmt(Math.abs(x), 4);
+  renderTable("money-rows", "money-empty", rows, r => [NAME[r.k], `${fmt(cap + r.sol, 4)} SOL`,
+    el("span", {class: "amt " + (r.sol >= 0 ? "pos" : "neg"), text: `${sign(r.sol)} SOL (${r.pct >= 0 ? "+" : "−"}${fmt(Math.abs(r.pct), 2)}%)${usd(r.sol)}`}),
+    el("span", {class: r.vs >= 0 ? "pos" : "neg", text: `${sign(r.vs)} SOL`})]);
+  if (!rows.length) { $("money-say").textContent = "Waiting for an hour of data…"; $("money-note").textContent = ""; return; }
+  const best = rows.reduce((a, b) => b.sol > a.sol ? b : a), worst = rows.reduce((a, b) => b.sol < a.sol ? b : a);
+  const hrs = Math.max(...rows.map(r => r.v.hours || 0));
+  $("money-say").replaceChildren(
+    best.sol >= 0 ? "So far the best plan would have " : "So far every plan would have lost money. The least bad would have ",
+    el("b", {class: best.sol >= 0 ? "pos" : "neg", text: `${best.sol >= 0 ? "earned" : "lost"} ${fmt(Math.abs(best.sol), 4)} SOL${usd(best.sol)}`}),
+    ` (${NAME[best.k].toLowerCase()})` + (worst !== best ? "; the worst would have " : "."),
+    ...(worst !== best ? [el("b", {class: worst.sol >= 0 ? "pos" : "neg", text: `${worst.sol >= 0 ? "earned" : "lost"} ${fmt(Math.abs(worst.sol), 4)} SOL`}), "."] : []));
+  $("money-note").textContent = `Your real ${fmt(cap, 4)} SOL is untouched: these are pretend positions, averaged over every pool so no lucky pick is counted. `
+    + `"Earned / lost" is the change in value from the start${hrs ? ` (${fmt(hrs, 1)} h ago)` : ""}, including the coins' own price moves; `
+    + `"vs just holding" is only what providing liquidity added or cost. Costs to open and close are not yet taken off.`;
+}
+
 function renderStatus(s) {
   const lp = (s.lp || []).filter(r => r.hours > 0), good = cssv("--good"), bad = cssv("--critical"), warn = cssv("--warning");
   const hrs = lp.length ? Math.max(...lp.map(r => r.hours)) : 0;
@@ -702,6 +780,21 @@ function showTab(t) {
 }
 document.querySelectorAll("#tabbar button").forEach(b => b.addEventListener("click", () => { showTab(b.dataset.tab); refresh(); }));
 showTab(tab);
+
+const THEMES = ["auto", "light", "dark"], TLABEL = {auto: "◐ Auto", light: "☀ Light", dark: "☾ Dark"};
+let theme = "auto";
+try { theme = localStorage.getItem("orbit-theme") || "auto"; } catch (e) {}
+function applyTheme(t, redraw = true) {
+  theme = THEMES.includes(t) ? t : "auto";
+  if (theme === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem("orbit-theme", theme); } catch (e) {}
+  $("theme").textContent = TLABEL[theme];
+  SERIES = readSeries();
+  if (redraw) refresh();
+}
+$("theme").addEventListener("click", () => applyTheme(THEMES[(THEMES.indexOf(theme) + 1) % 3]));
+try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (theme === "auto") applyTheme("auto"); }); } catch (e) {}
+applyTheme(theme, false);
 
 function renderSpread(s) {
   const sp = s.lp_spread || {}, parts = [];
@@ -934,6 +1027,7 @@ async function refresh() {
   renderMood(s);
   renderSpread(s);
   renderStatus(s);
+  renderMoney(s);
   renderAudit(s);
   lastLp = s.lp || [];
   renderLp();
