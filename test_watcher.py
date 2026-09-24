@@ -754,9 +754,11 @@ class OrcaAdaptiveFee(TempDirCase):
 
 class NoTradingCode(unittest.TestCase):
     def test_no_signing_or_sending(self):
-        src = Path(W.__file__).read_text()
-        for word in ("sendTransaction", "sendBundle", "private_key", "secret_key", "Keypair", "signTransaction"):
-            self.assertNotIn(word, src)
+        root = Path(W.__file__).parent
+        for name in ("watcher.py", "server.py", "regime.py", "regime_skill.py", "dashboard.html"):
+            src = (root / name).read_text()
+            for word in ("sendTransaction", "sendBundle", "private_key", "secret_key", "Keypair", "signTransaction"):
+                self.assertNotIn(word, src, f"{word} found in {name}")
 
 
 class PoolEarningsTests(unittest.TestCase):

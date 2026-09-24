@@ -1,224 +1,154 @@
-# Orbit Dislocation Watcher
+<div align="center">
 
-A **read-only** research tool. It answers one question with real data:
+# 🛰️ ORBIT
 
-> When a big trade knocks one pool's price out of line, how big is the gap after fees, and how fast does someone close it?
+**A read-only Solana DEX observatory that measures, with on-chain data, whether "free money" strategies actually pay.**
 
-If most gaps close within one or two Solana slots (0.4–0.8 seconds), a home-built bot can't win them. If some last longer, you can inspect them one by one.
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-zero-2ea44f)
+![Tests](https://img.shields.io/badge/tests-120%20passing-2ea44f)
+![Read-only](https://img.shields.io/badge/mode-read--only-blue)
+![Solana](https://img.shields.io/badge/chain-Solana-9945FF?logo=solana&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-**It never trades.** There's no wallet, no signing, no transaction sending, and no private key anywhere. A test checks that the code contains none of that.
+[What it found](#-what-it-found) · [Features](#-features) · [Architecture](#-architecture) · [Quick start](#-quick-start) · [Deploy](#-deploy-in-10-minutes) · [Full guide](GUIDE.md)
 
-## Two ways to use it
+<img src="screenshot-overview.png" alt="Orbit dashboard: overview tab" width="860">
 
-1. **Hosted private dashboard (recommended).** Runs around the clock on Railway behind a password. Follow **[DEPLOY.md](DEPLOY.md)**.
-2. **Command line on any computer.** Follow the steps below.
-
-To try the dashboard on your own computer first:
-
-```sh
-# macOS/Linux
-export ADMIN_PASSWORD='choose-a-long-password'
-python3 server.py
-# Windows PowerShell
-$env:ADMIN_PASSWORD='choose-a-long-password'
-python server.py
-```
-
-Then open http://localhost:8080.
+</div>
 
 ---
 
-## What you need
+## Why
 
-- **Python 3.10 or newer.** Nothing else: no `pip install`. Check your version with `python --version`.
-- An internet connection. The free public Solana address works to start. For long runs, a free RPC key (from Helius, QuickNode or Triton) is more reliable. See *Using your own RPC* below.
+Social media is full of claims like *"my Solana arbitrage bot prints money every day"*. Orbit was built to test those claims with data instead of opinion.
 
-## Step 1: find pools for a token
+It streams live pool state from the chain, re-computes every price from raw account bytes, and records what really happens: how big each price gap is after fees, how fast it closes, **who closes it and what they paid**, and whether providing liquidity beats simply holding the coins.
 
-Pick a token that trades in **several Raydium or PumpSwap pools** against SOL or USDC. Copy its mint address (from Solscan or DexScreener), then run:
+> **It never trades.** No wallet, no signing, no transaction sending, no private keys. A unit test fails the build if trading code ever appears.
 
-```sh
-python watcher.py discover <TOKEN_MINT> --write
-```
+## 📊 What it found
 
-This command:
+Results from the author's own runs (about 46 hours, 4 million pool updates, 12 tokens):
 
-1. asks DexScreener which pools exist for the token;
-2. checks which program runs each pool and keeps the supported types (Raydium AMM v4, CPMM, CLMM; PumpSwap; Orca Whirlpool; Meteora DLMM) above $10k liquidity;
-3. finds each pool's two reserve vaults automatically;
-4. saves everything to `config.json`.
-
-It also tells you which pools it skipped and why (dust liquidity, unsupported type, or not paired with SOL/USDC).
-
-You can run `discover` several times with different tokens. Each token becomes its own "watch" in `config.json`.
-
-## Step 2: watch
-
-```sh
-python watcher.py watch
-```
-
-It loads the current balances, then streams every change live. Once a minute it prints a status line, for example:
-
-```
-[14:02:11]   3.0 min | updates 412 | slot 448712003 | shocks 2 | profitable gaps closed 0 | open now 0 | TOKEN/SOL gap 0.084%
-```
-
-Stop it with **Ctrl+C**. A report prints when it stops. To stop automatically after a set time: `python watcher.py watch --minutes 120`.
-
-Leave it running for a day or more. Busy hours and quiet hours behave differently.
-
-## Step 3: read the report
-
-```sh
-python watcher.py report
-```
-
-It shows:
-
-- **Shocks.** The number of times one pool's price jumped by at least `shock_pct` in a single update, and how often that left a profitable gap visible to you.
-- **Profitable gaps.** How many were seen, the share that closed within 1 and 2 slots, the median time open, and the size of the theoretical best profit.
-- **What this means.** A plain-language reading of the numbers.
-
-## Step 4 (optional): replay with different assumptions
-
-Every raw balance change is saved in `data/raw_updates.jsonl`. Change the cost or threshold numbers in `config.json`, then run:
-
-```sh
-python watcher.py replay
-```
-
-This re-analyses the saved data (results go to `data_replay/`) without reconnecting to anything.
-
----
-
-## Settings in config.json
-
-| Setting | Meaning |
+| Question | Answer from the data |
 |---|---|
-| `cost_quote` | Your assumed cost per attempt (network fee plus priority fee plus Jito tip), in the quote token. Default: 0.0005 SOL or 0.10 USDC. **This is a guess. Adjust it.** |
-| `min_profit_quote` | A gap only counts if the best profit after `cost_quote` is at least this much. |
-| `shock_pct` | The price jump in one update that counts as a "shock". Default: 0.5%. |
-| `fee` (per pool) | The pool's swap fee. Defaults: 0.25% (Raydium), 0.30% (PumpSwap). Raydium CPMM pools can be 0.25%, 1%, 2% or 4%: check each pool on Raydium's site. |
-| `commitment` | `processed` gives the fastest view of changes. |
-| `evaluate_delay_ms` | How long to wait after an update before comparing pools, so that both vaults of a swap have arrived. |
+| Are there price gaps between Solana DEXes? | **Yes.** 660 gaps that were profitable after fees. |
+| Can a normal setup catch them? | **No.** 54% closed within **one slot (0.4 s)**, 61% within two. |
+| Who closes them? | Arbitrage bots trading both pools in **one atomic transaction**, often paying tiny or no Jito tips. |
+| Triangle loops (SOL→token→USDC→SOL)? | 13 profitable loops seen, and **every one closed within 1 slot**. Best was +0.074 SOL, gone in 0.19 s. |
+| Is Orbit's price maths right? | **Yes.** 4,035 real swaps re-priced from the pool state just before them: **100% within 0.1%**. |
+| Does providing liquidity beat holding? | First day: spread across every pool, **−1.95%** (±5% ranges) and **−0.54%** (±20% ranges). One token (WIF) won everywhere, but nothing predicted it in advance. The 72-hour verdict is judged by rules fixed in advance and is still running. |
 
-## Using your own RPC
+**Bottom line so far:** the gaps are real, but they belong to co-located, Rust-based searchers with sub-100 ms pipelines. A home setup watches them close.
 
-Set these in the terminal before running, so your key never goes into a file.
+## ✨ Features
 
-macOS/Linux:
-```sh
-export SOLANA_RPC_HTTP='https://YOUR-RPC-URL'
-export SOLANA_RPC_WS='wss://YOUR-RPC-URL'
+**Market microstructure**
+- ⚡ Live WebSocket account streaming at `processed` commitment, with latency to the chain tip measured every slot
+- 🧮 Exact swap maths for **Raydium AMM v4, Raydium CPMM, PumpSwap**; price and live fees for **Orca Whirlpool, Raydium CLMM, Meteora DLMM and DAMM v2**
+- 📏 Depth checks: simulated 0.25 / 1 / 2.5 SOL round trips, not just top-of-book prices
+- 🔺 Triangle-loop detection across SOL and USDC pools
+- 🕵️ **Auditor**: finds the real transaction that closed each gap (winner, Jito tip, priority fee, programs used)
+- ✅ **Reality check**: re-quotes real swaps from historical pool state to prove the maths
+- 🆕 New-pool hunter that auto-watches fresh tokens for 30 minutes
+
+**Liquidity-provider research**
+- 💧 Paper CLMM positions in every pool: **±5%, ±20% and ±5% auto-rebalancing** (Hummingbot-style)
+- 📈 Fees read from each pool's on-chain `fee_growth_global` counters, impermanent loss measured against holding
+- ⚖️ A **"realistic result"** that averages every position, so no cherry-picked winners
+- 🧪 **Pass/fail verdict rules written before the results**: beat holding, already ahead at 24 h, and day-1 leaders must keep leading
+
+**Market context**
+- 🌡️ Crypto regime score (0–100) from the MIT-licensed [crypto-regime-analyzer](https://github.com/tradermonty/claude-trading-skills) skill
+- ☁️ **LP weather**: how often each token stayed inside ±5% / ±20% over 3 and 7 days of history
+- 🛡️ **Token safety** read from the chain: mint/freeze authority, risky Token-2022 extensions, holder concentration
+
+**Operations**
+- 🩺 13 automatic health checks with Telegram alerts on failure and recovery
+- 🗜️ Raw data rotated and gzipped every 6 h (about 7× smaller); automatic disk-space protection
+- 📦 One-click **analysis bundle** with secrets masked
+- 🔐 Password login, rate-limited, CSP with per-request nonces, same-origin API
+- 🌓 Light and dark themes, five dashboard tabs, works on a phone
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart LR
+    RPC[(Solana RPC<br/>WebSocket + HTTPS)] -->|account updates| ENG[Engine<br/>decode pools · price maths]
+    ENG --> GAP[Gap and loop detector<br/>depth checks]
+    ENG --> LP[Paper LP book<br/>±5% · ±20% · auto]
+    GAP -->|gap closed| AUD[Auditor<br/>who took it?]
+    AUD -->|getTransaction| RPC
+    ENG --> REC[(Recorder<br/>CSV · JSONL · gzip)]
+    CG[CoinGecko · OKX] --> MOOD[Market mood<br/>regime · LP weather · safety]
+    GAP & LP & AUD & MOOD --> SRV[Server<br/>dashboard · health · alerts]
+    SRV --> TG[Telegram]
+    SRV --> WEB[Browser dashboard]
 ```
-Windows PowerShell:
-```powershell
-$env:SOLANA_RPC_HTTP='https://YOUR-RPC-URL'
-$env:SOLANA_RPC_WS='wss://YOUR-RPC-URL'
-```
 
-## Pool earnings (liquidity-provider research)
+| File | Role |
+|---|---|
+| `watcher.py` | Pool decoders, pricing maths, engine, paper LP positions, auditor, recorder, report |
+| `server.py` | Dashboard server, login, supervision, health checks, archives, alerts |
+| `regime.py` · `regime_skill.py` | Market mood (the regime scoring is kept word for word from the original skill) |
+| `dashboard.html` | Single-file UI: plain JavaScript and hand-drawn SVG charts, no frameworks |
+| `test_*.py` | 120 offline tests, including fake Solana, CoinGecko and OKX servers |
 
-For every Orca Whirlpool and Raydium CLMM pool you watch (plus the SOL/USDC reference pool, if it is one of
-those kinds), Orbit keeps two pretend liquidity positions of 100 SOL/USDC each: one over a price range of
-±5% and one over ±20%, centred on the price when tracking started. No money is involved.
+**Design choices:** Python standard library only (nothing to `pip install`, a tiny attack surface), one process, state on a single volume, and every external call read-only.
 
-- **Fees earned** come from the pool's own on-chain fee counter, so they are what a real position that size
-  would have collected while the price was inside its range.
-- **Price-move loss** compares the position with simply holding the coins it started with (often called
-  impermanent loss).
-- **Net vs holding** = fees + price-move loss. Positive means providing liquidity beat holding.
-- **Worst so far** is the lowest that position has been, so a bad stretch is not hidden by an average.
-- **On your SOL / day** applies today's pace to your own capital (set `ORBIT_LP_CAPITAL_SOL`, default 2.5 SOL).
-- **Days to break even** compares that with the cost of opening and closing the position: network fees plus
-  the swaps in and out (the pool's own fee on your capital).
-
-Positions are saved to `data/lp_state.json` every 30 seconds, so restarts don't reset them. Odd pool
-readings (a fee counter that appears to move backwards, an impossible one-update jump, or the same slot
-seen twice) are ignored and counted as "odd pool readings ignored"; a position whose numbers stop making
-sense is started again automatically. "Reset tracking" on the dashboard starts every position from scratch. Results show on
-the dashboard ("Pool earnings") and in the report. Judge them after several days: one sharp price move
-can wipe out weeks of fees, especially on memecoins. Meteora and constant-product pools are not measured.
-
-## Reading real transactions (who took it, reality check)
-
-A background worker looks up real transactions, gently (about one RPC call every 0.7 s), and writes:
-
-- **`closers.csv`, who took the gaps.** For every closed gap, the transaction that closed it: winning wallet, Jito
-  tip, total cost, and whether it bought on one pool and sold on the other in one transaction (an arbitrage bot).
-- **`quote_checks.csv`, reality check.** Every ~45 s, a real swap in a watched pool is re-quoted from the pool state
-  just before it and compared with what actually came out. Small errors mean the depth checks and earnings can be
-  trusted; large errors on concentrated pools usually mean the trade crossed a price tick.
-
-Set `ORBIT_AUDIT=0` to switch the worker off (for example on a public RPC that limits requests).
-
-## Triangle loops
-
-For tokens with both a SOL and a USDC pool, Orbit also simulates the full loop SOL → token → USDC → SOL (and back)
-with all three swaps on their own pools, including the SOL/USDC pool's depth and fee. Profitable loops are timed
-like gaps and written to `loops.csv`.
-
-## Pool types
-
-Supported: Raydium AMM v4, Raydium CPMM, PumpSwap, Orca Whirlpool, Raydium CLMM, Meteora DLMM, and **Meteora
-DAMM v2** (priced from its account using Meteora's published layout; its base fee is used, the most it can charge).
-Not supported, on purpose: SolFi and Vertigo price trades with private logic or unpublished curves, so reading their
-vaults would show gaps that are not real.
-
-## Output files (folder `data/`)
-
-- `dislocations.csv`: one row per profitable gap: which pools, when it opened, slots and seconds open, peak gap %, peak net profit, best trade size.
-- `shocks.csv`: one row per price jump, and whether a profitable gap was visible.
-- `raw_updates.jsonl`: every vault balance change (used by `replay`). Every 6 hours (or at 64 MB) it is moved to
-  `archive/raw/` and gzipped (about 7x smaller); the oldest compressed files go once they pass
-  `ORBIT_RAW_KEEP_MB` (default 1000). `replay --input` reads `.jsonl.gz` files directly.
-- `archive/reports/<time>-<why>/`: a copy of the report, CSVs and earnings, saved automatically before every
-  "Reset tracking" and whenever you press "Save a copy now".
-
-## Market mood (crypto regime + LP weather)
-
-A background job (every 6 hours) scores the crypto market from 0 (risk-off) to 100 (risk-on) using the six
-components of the crypto-regime-analyzer skill from github.com/tradermonty/claude-trading-skills (MIT; the scoring
-files are kept word for word inside `regime_skill.py`, with the licence at its top). Orbit fetches the data
-itself with the standard library: CoinGecko's free API, plus funding from Binance or, if Binance blocks the server's
-region, OKX. BTC dominance needs 31 days of daily readings before it counts; until then its weight is shared out.
-
-Orbit adds "LP weather": for each of your tokens, how often its price (against SOL and the dollar) stayed within
-+/-5% and +/-20% over 3-day and 7-day stretches in the last 90 days. Results go to `regime.json`, one line per run
-to `regime_log.jsonl`, a MARKET MOOD section in the report, and a Telegram alert when the zone changes.
-Set `ORBIT_MOOD=0` to turn it off. It describes the market; it is not a buy or sell signal.
-
-## Saved reports and the analysis bundle
-
-The dashboard's "Saved reports & data" section lists earlier reports and compressed raw files, each downloadable.
-"Download analysis bundle" gives one small zip (report, all CSVs, earnings, dashboard state, recent activity and
-every earlier report, but no raw data), with API keys and bot tokens masked. It is the file to share for a review.
-
-Per-day figures and "days to break even" read "too early" until a position has 1 hour of data, and a pace that
-would take more than a year to pay back reads "never at this pace".
-
-## Honest limits
-
-- **You can't see gaps that open and close inside one slot.** Updates arrive at most once per slot per account, and a searcher can close a gap in the same block. Seeing *zero* gaps is therefore a meaningful result: it means nothing lasted long enough for you.
-- "Best net" is a ceiling from pool maths minus your cost guess. It isn't a fill. Other traders, slippage, token transfer taxes and frozen tokens can all make a gap untradable.
-- Supported pools: Raydium AMM v4, Raydium CPMM and PumpSwap (exact profit maths), plus Orca Whirlpool, Raydium CLMM and Meteora DLMM (price and live fee read from the pool; gap after fees only, no size estimate). Meteora DAMM pools aren't supported.
-- SOL and USDC pools of the same token are compared through a live SOL/USDC reference pool, including that pool's swap fee.
-- A concentrated pool whose price lands more than 50% away from the others is excluded and reported in the log, as a guard against decoding errors.
-- Raydium AMM v4 vault balances can include small amounts that aren't tradable reserves. Treat tiny gaps on those pools with caution.
-- A lost connection drops any gap that was open at the time, instead of timing it wrongly.
-- The public Solana RPC may limit subscriptions. If you see repeated reconnects, use your own RPC.
-
-## Checking it works
+## 🚀 Quick start
 
 ```sh
-python -m unittest -v
+git clone https://github.com/effess96/orbit-watcher && cd orbit-watcher
+export ADMIN_PASSWORD='choose-a-long-password'
+python3 server.py          # open http://localhost:8080 and add a token mint
 ```
 
-The 40 offline tests run against a fake Solana server on your own computer, with no internet needed. They cover pool maths, vault discovery, the WebSocket client (including pings and reconnects), gap timing, replay, the report and the dashboard (login, lockout, security headers, adding and removing tokens, downloads), and they check that no trading code exists.
+Command-line mode, without the dashboard:
 
-**Not yet tested against the real Solana network.** The build environment had no internet access. Your first real `discover` and `watch` runs are that test. If something fails, send me the error message.
+```sh
+python3 watcher.py discover <TOKEN_MINT>   # finds its supported pools and writes config.json
+python3 watcher.py watch                   # streams and records
+python3 watcher.py report                  # prints the findings
+```
 
-### Mac certificate error
+A free RPC key (Helius, QuickNode, Triton) is recommended for long runs: set `SOLANA_RPC_HTTP` and `SOLANA_RPC_WS`.
 
-If you see `CERTIFICATE_VERIFY_FAILED` on a Mac, run the `Install Certificates.command` file in your Python folder under Applications, once.
+## ☁️ Deploy in 10 minutes
+
+Runs 24/7 on [Railway](https://railway.app) using the included `Dockerfile` and `railway.json`, with a volume at `/data`. Step-by-step: **[DEPLOY.md](DEPLOY.md)**.
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `ADMIN_PASSWORD` | ✅ | Dashboard login, 12+ characters |
+| `SOLANA_RPC_HTTP` / `SOLANA_RPC_WS` | recommended | Your own RPC endpoints |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | optional | Alerts, daily summary, trouble notices |
+| `ORBIT_LP_CAPITAL_SOL` | optional | Capital used in the SOL-per-day figures (default 2.5) |
+
+<div align="center"><img src="screenshot-charts.png" alt="Orbit dashboard: charts tab" width="760"></div>
+
+## 🧪 Tests
+
+```sh
+python3 -m unittest test_watcher test_server test_regime
+```
+
+120 tests, fully offline. They cover every pool decoder against real account layouts, fee-counter wrap-around guards, WebSocket reconnects, the auditor, verdict rules, health checks, disk trimming, login lockout and security headers, **and an assertion that no signing or sending code exists.**
+
+## ⚠️ Honest limits
+
+- Gaps that open and close inside a single slot are invisible to any account-streaming observer, so real competition is even faster than Orbit can show.
+- Concentrated-liquidity depth uses a single-range approximation. Large trades that cross ticks are optimistic.
+- Paper LP positions ignore the gas and rent of real positions and use daily prices for weather. Real results will be a little worse.
+- Nothing here is financial advice. It is a measuring instrument, and its main finding so far is that most "easy" strategies aren't.
+
+## 🙏 Credits
+
+- Regime scoring: [crypto-regime-analyzer](https://github.com/tradermonty/claude-trading-skills) by TraderMonty (MIT), embedded unchanged in `regime_skill.py`
+- Rebalancing idea: [Hummingbot](https://hummingbot.org). Token-safety idea: sentry-bot.
+- Pool layouts verified against the Orca, Raydium and Meteora open-source programs
+
+## License
+
+[MIT](LICENSE). Use it, fork it, and prove your own bot claims with data.
