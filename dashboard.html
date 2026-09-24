@@ -300,7 +300,7 @@ tbody tr:hover td{background:var(--panel-2)}
       <th>7 days ±5%</th><th>7 days ±20%</th><th>Typical 7-day move</th><th>±5% weather</th><th>±20% weather</th><th>Token safety</th></tr></thead><tbody id="mood-weather"></tbody></table></div>
     <div id="mood-weather-empty" class="empty">The first reading arrives about 5–7 minutes after Orbit starts (CoinGecko's free tier is slow on purpose).</div>
     <p class="note">Weather is judged separately for each range over 3-day stretches: "calm" = the price stayed inside 80%+ of the time, so the position mostly keeps earning fees; "choppy" = 50–80%; "stormy" = under 50%, where it is often pushed out of range and price moves tend to beat the fees.
-      Daily closes hide intraday swings, so real figures are a little worse.
+      Hourly prices catch most intraday swings (moves inside one hour are missed).
       Token safety is read from the chain: "risky" = someone can still create more tokens or freeze holders' tokens (a liquidity position could be diluted or locked); "caution" = risky token features or the top 10 holders own over half; hover for details. "Top 10 hold" leaves out the pools Orbit watches but still counts exchanges.</p>
   </section>
   </div>
@@ -752,7 +752,8 @@ function renderMoney(s) {
     ...(worst !== best ? [el("b", {class: worst.sol >= 0 ? "pos" : "neg", text: `${worst.sol >= 0 ? "earned" : "lost"} ${fmt(Math.abs(worst.sol), 4)} SOL`}), "."] : []));
   $("money-note").textContent = `Your real ${fmt(cap, 4)} SOL is untouched: these are pretend positions, averaged over every pool so no lucky pick is counted. `
     + `"Earned / lost" is the change in value from the start${hrs ? ` (${fmt(hrs, 1)} h ago)` : ""}, including the coins' own price moves; `
-    + `"vs just holding" is only what providing liquidity added or cost. Costs to open and close are not yet taken off.`;
+    + `"vs just holding" is only what providing liquidity added or cost. Both already include the cost of opening and closing `
+    + `each position (network fees plus the swaps in and out, about ${fmt((best.v.avg_cost_pct || 0), 2)}% of your capital).`;
 }
 
 const HICON = {ok: "✓", warn: "!", fail: "✗", wait: "…"}, HLABEL = {ok: "OK", warn: "Check", fail: "Problem", wait: "Starting"};

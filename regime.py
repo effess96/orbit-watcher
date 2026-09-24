@@ -11,8 +11,8 @@ Two parts:
 2. Solana "LP weather" (Orbit's own addition). For every token you watch, how often did its price
    (against SOL and against the dollar) stay inside +/-5% and +/-20% over 3-day and 7-day windows
    in the last 90 days? That is a history-based guide to how long a paper liquidity position in that
-   range would have kept earning fees. It uses daily closes, so real intraday swings were larger:
-   treat the figures as optimistic.
+   range would have kept earning fees. It uses hourly prices (daily closes as a fallback), so most intraday
+   swings are caught; moves inside a single hour are not.
 
 Everything here describes the market. None of it is a buy or sell signal, and nothing here trades.
 
@@ -153,6 +153,22 @@ class RegimeData:
         self.sleep(self.delay)
         return closes
 
+    def hourly(self, coin_id: str) -> list[tuple[int, float]]:
+        """Hourly prices for the last 90 days as (hour number, price). CoinGecko's free tier returns hourly points
+        automatically for 2-90 day ranges; these catch the intraday swings that knock liquidity out of range."""
+        cached = self._cached(f"hourly_{coin_id}")
+        if cached:
+            return [tuple(x) for x in cached]
+        raw = self._get(f"{COINGECKO}/coins/{coin_id}/market_chart?vs_currency=usd&days={WEATHER_DAYS}")
+        pts = {}
+        for t, px in raw.get("prices", []):
+            if px and float(px) > 0:
+                pts[int(t // 3_600_000)] = float(px)
+        out = sorted(pts.items())
+        self._store(f"hourly_{coin_id}", out)
+        self.sleep(self.delay)
+        return out
+
     def dominance(self) -> float:
         cached = self._cached("dominance_now")
         if cached is not None:
@@ -272,6 +288,73 @@ def range_weather(prices: list[float], days: int = WEATHER_DAYS) -> dict | None:
     return out
 
 
+def sliding_extremes(xs: list[float], length: int) -> tuple[list[float], list[float]]:
+    """Max and min of every run of `length` consecutive values (index = run start), in linear time."""
+    import collections as _c
+    hi, lo, mx, mn = _c.deque(), _c.deque(), [], []
+    for i, x in enumerate(xs):
+        while hi and xs[hi[-1]] <= x:
+            hi.pop()
+        while lo and xs[lo[-1]] >= x:
+            lo.pop()
+        hi.append(i)
+        lo.append(i)
+        if hi[0] <= i - length:
+            hi.popleft()
+        if lo[0] <= i - length:
+            lo.popleft()
+        if i >= length - 1:
+            mx.append(xs[hi[0]])
+            mn.append(xs[lo[0]])
+    return mx, mn
+
+
+def range_weather_hourly(prices: list[float], days: int = WEATHER_DAYS) -> dict | None:
+    """Same measures as range_weather, from hourly prices: a window only counts as 'inside' if every hour stayed
+    within the band of the window's starting price."""
+    per = 24
+    need = max(WINDOWS) * per
+    if len(prices) < need + 10 * per:
+        return None
+    last = prices[-(days * per + need):]
+    out = {"days": round((len(last) - need) / per), "resolution": "hourly"}
+    for w in WINDOWS:
+        L = w * per + 1
+        mx, mn = sliding_extremes(last, L)
+        starts = last[:len(mx)]
+        for b in BANDS:
+            inside = sum(1 for s0, a, c in zip(starts, mx, mn) if a / s0 - 1 <= b and 1 - c / s0 <= b)
+            out[f"in_{w}d_{round(b * 100)}"] = round(100 * inside / len(mx), 1)
+        moves = sorted(abs(last[i + L - 1] / last[i] - 1) * 100 for i in range(len(mx)))
+        out[f"median_move_{w}d"] = round(moves[len(moves) // 2], 2)
+    daily = prices[per - 1::per]
+    out["vol30"] = realised_vol(daily)
+    return out
+
+
+def ratio_hourly(a: list[tuple[int, float]], b: list[tuple[int, float]]) -> list[float]:
+    """Token price in SOL, hour by hour, matching the two series on the same hour."""
+    bb = dict(b)
+    return [pa / bb[h] for h, pa in a if bb.get(h)]
+
+
+def weather_for(data: "RegimeData", cid: str, daily: list[float], sol_daily: list[float],
+                sol_hourly: list, vs_sol: bool, vs_usd: bool) -> tuple[dict | None, dict | None]:
+    """Hourly weather when available, daily closes as the fallback."""
+    try:
+        h = data.hourly(cid)
+    except Exception:
+        h = []
+    hp = [p for _, p in h]
+    ws = wu = None
+    if vs_sol:
+        ws = (range_weather_hourly(ratio_hourly(h, sol_hourly)) if h and sol_hourly else None) \
+            or range_weather(ratio(daily, sol_daily))
+    if vs_usd:
+        wu = (range_weather_hourly(hp) if hp else None) or range_weather(daily)
+    return ws, wu
+
+
 def ratio(a: list[float], b: list[float]) -> list[float]:
     n = min(len(a), len(b))
     return [x / y for x, y in zip(a[-n:], b[-n:]) if y > 0]
@@ -309,13 +392,18 @@ def analyse(data: RegimeData, watches: list[dict]) -> dict:
     reg = regime_from_snapshot(series, dom, funding)
 
     sol = ids.get("solana") or data.history("solana")
+    try:
+        sol_hourly = data.hourly("solana")
+    except Exception:
+        sol_hourly = []
     sol_trend = calculate_btc_trend(sol) if sol else {"data_available": False, "signal": "no data"}
     sol_view = {"price": round(sol[-1], 2) if sol else None, "score": sol_trend.get("score"),
                 "signal": str(sol_trend.get("signal", "")).replace("BTC", "SOL"),
                 "data_available": bool(sol_trend.get("data_available")),
                 "vol30": realised_vol(sol) if sol else None,
                 "change_30d_pct": round((sol[-1] / sol[-31] - 1) * 100, 1) if sol and len(sol) > 31 else None,
-                "weather_usd": range_weather(sol) if sol else None}
+                "weather_usd": (range_weather_hourly([x for _, x in sol_hourly]) if sol_hourly else None)
+                               or (range_weather(sol) if sol else None)}
 
     tokens = []
     for w in watches:
@@ -329,10 +417,10 @@ def analyse(data: RegimeData, watches: list[dict]) -> dict:
             row["coingecko"] = cid
             try:
                 closes = ids.get(cid) or data.history(cid)
-                if "SOL" in w["quotes"] and sol and cid != "solana":
-                    row["vs_sol"] = range_weather(ratio(closes, sol))
-                if "USDC" in w["quotes"] or cid == "solana":
-                    row["vs_usd"] = range_weather(closes)
+                row["vs_sol"], row["vs_usd"] = weather_for(
+                    data, cid, closes, sol, sol_hourly,
+                    vs_sol="SOL" in w["quotes"] and bool(sol) and cid != "solana",
+                    vs_usd="USDC" in w["quotes"] or cid == "solana")
                 if not (row["vs_sol"] or row["vs_usd"]):
                     row["note"] = "too little history"
             except Exception as e:

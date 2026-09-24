@@ -6,7 +6,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/dependencies-zero-2ea44f)
-![Tests](https://img.shields.io/badge/tests-120%20passing-2ea44f)
+![Tests](https://img.shields.io/badge/tests-125%20passing-2ea44f)
 ![Read-only](https://img.shields.io/badge/mode-read--only-blue)
 ![Solana](https://img.shields.io/badge/chain-Solana-9945FF?logo=solana&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
@@ -93,7 +93,7 @@ flowchart LR
 | `server.py` | Dashboard server, login, supervision, health checks, archives, alerts |
 | `regime.py` · `regime_skill.py` | Market mood (the regime scoring is kept word for word from the original skill) |
 | `dashboard.html` | Single-file UI: plain JavaScript and hand-drawn SVG charts, no frameworks |
-| `test_*.py` | 120 offline tests, including fake Solana, CoinGecko and OKX servers |
+| `test_*.py` | 125 offline tests, including fake Solana, CoinGecko and OKX servers |
 
 **Design choices:** Python standard library only (nothing to `pip install`, a tiny attack surface), one process, state on a single volume, and every external call read-only.
 
@@ -134,13 +134,13 @@ Runs 24/7 on [Railway](https://railway.app) using the included `Dockerfile` and 
 python3 -m unittest test_watcher test_server test_regime
 ```
 
-120 tests, fully offline. They cover every pool decoder against real account layouts, fee-counter wrap-around guards, WebSocket reconnects, the auditor, verdict rules, health checks, disk trimming, login lockout and security headers, **and an assertion that no signing or sending code exists.**
+125 tests, fully offline. They cover every pool decoder against real account layouts, fee-counter wrap-around guards, WebSocket reconnects, the auditor, verdict rules, health checks, disk trimming, login lockout and security headers, **and an assertion that no signing or sending code exists.**
 
 ## ⚠️ Honest limits
 
 - Gaps that open and close inside a single slot are invisible to any account-streaming observer, so real competition is even faster than Orbit can show.
 - Concentrated-liquidity depth uses a single-range approximation. Large trades that cross ticks are optimistic.
-- Paper LP positions ignore the gas and rent of real positions and use daily prices for weather. Real results will be a little worse.
+- Paper LP positions ignore the gas and rent of real positions and weather uses hourly prices. Real results will be a little worse.
 - Nothing here is financial advice. It is a measuring instrument, and its main finding so far is that most "easy" strategies aren't.
 
 ## 🙏 Credits

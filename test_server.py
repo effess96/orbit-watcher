@@ -259,7 +259,7 @@ class HunterAndAlerts(unittest.TestCase):
             self.assertEqual(app.hunt_once(), [])                             # same token not re-added
         cfg = app.config()
         self.assertTrue(cfg["watches"][0]["auto_until"] > time.time())
-        self.assertEqual(app.hunter["recent"][0]["result"], "watching 2 pools for 30 min")
+        self.assertTrue(app.hunter["recent"][0]["result"].startswith("watching 2 pools for 30 min; safety: "))
         cfg["watches"][0]["auto_until"] = time.time() - 1
         app.save_config(cfg)
         with contextlib.redirect_stdout(io.StringIO()):

@@ -757,6 +757,8 @@ class LpSim:
                 "skipped_updates": self.skipped, "early": early,
                 "strategy": "rebalance" if self.rebalance else "static", "rebalances": self.rebalances,
                 "vs_quote_pct": round(pct(lp_now + fees - LP_START_VALUE), 4),
+                "cost_pct": round(100 * cost / LP_CAPITAL_SOL, 4),        # opening + closing, as % of your capital
+                "net_after_costs_pct": round(net - 100 * cost / LP_CAPITAL_SOL, 4),
                 "day1_net_pct": None if self.day1 is None else round(self.day1, 4),
                 "rebalance_cost_pct": round(pct(self.rebalance_cost), 4),
                 "in_range_now": self.sa <= self.pool.sq <= self.sb}
@@ -2139,7 +2141,7 @@ def mood_report(folder: Path) -> list[str]:
     if sol.get("price"):
         out.append(f"  SOL: ${sol['price']:,.2f}; 30-day change {sol.get('change_30d_pct')}%; 30-day volatility "
                    f"{sol.get('vol30')}%/yr; trend: {sol.get('signal')}")
-    out.append("  LP weather (last 90 days, daily closes; % of windows the price stayed inside the range):")
+    out.append("  LP weather (last 90 days, hourly prices; % of windows the price stayed inside the range):")
     out.append("  token | vs | 3 days +/-5% | 3 days +/-20% | 7 days +/-5% | 7 days +/-20% | typical 7-day move | "
                "+/-5% weather | +/-20% weather")
     for t in m.get("tokens", []):
@@ -2162,8 +2164,8 @@ def mood_report(folder: Path) -> list[str]:
                 out.append(f"  {x.get('watch')}: {x['level']}{top}" + (f" - {'; '.join(x['flags'])}" if x["flags"] else ""))
     out.append("  Weather is judged per range on 3-day windows: 'calm' = price stayed inside 80%+ of the time (the "
                "position mostly keeps earning fees), 'choppy' = 50-80%, 'stormy' = under 50% (it is often pushed out "
-               "of range and price moves tend to beat the fees). Daily closes hide intraday swings, so real figures "
-               "are a little worse.")
+               "of range and price moves tend to beat the fees). Hourly prices catch most swings; moves inside one hour "
+               "are missed.")
     return out + [""]
 
 
@@ -2309,10 +2311,13 @@ def lp_spread(results: list[dict]) -> dict:
         rr = [r for r in results if r.get("range_pct") == rng and r.get("strategy", "static") == strat
               and r.get("hours", 0) >= LP_MIN_HOURS]
         if rr:
-            out[key] = {"n": len(rr), "ahead": sum(r["net_vs_hold_pct"] > 0 for r in rr),
-                        "avg_net_pct": round(statistics.mean(r["net_vs_hold_pct"] for r in rr), 3),
+            cost = lambda r: r.get("cost_pct", 0.0)
+            out[key] = {"n": len(rr), "ahead": sum(r["net_vs_hold_pct"] - cost(r) > 0 for r in rr),
+                        "avg_net_pct": round(statistics.mean(r["net_vs_hold_pct"] - cost(r) for r in rr), 3),
+                        "avg_net_before_costs_pct": round(statistics.mean(r["net_vs_hold_pct"] for r in rr), 3),
+                        "avg_cost_pct": round(statistics.mean(cost(r) for r in rr), 3),
                         "avg_sol_per_day": round(statistics.mean(r.get("net_sol_per_day", 0) for r in rr), 5),
-                        "avg_vs_quote_pct": round(statistics.mean(r.get("vs_quote_pct", 0) for r in rr), 3),
+                        "avg_vs_quote_pct": round(statistics.mean(r.get("vs_quote_pct", 0) - cost(r) for r in rr), 3),
                         "hours": round(max(r.get("hours", 0) for r in rr), 2)}
     return out
 
@@ -2334,11 +2339,12 @@ def lp_verdict(results: list[dict]) -> list[str]:
         rr = [r for r in done if r.get("range_pct") == rng and r.get("strategy", "static") == strat]
         if not rr:
             continue
-        avg = statistics.mean(r["net_vs_hold_pct"] for r in rr)
-        d1 = [r["day1_net_pct"] for r in rr if r.get("day1_net_pct") is not None]
+        cost = statistics.mean(r.get("cost_pct", 0.0) for r in rr)     # opening + closing, paid once
+        avg = statistics.mean(r["net_vs_hold_pct"] for r in rr) - cost
+        d1 = [r["day1_net_pct"] - r.get("cost_pct", 0.0) for r in rr if r.get("day1_net_pct") is not None]
         avg1 = statistics.mean(d1) if d1 else None
         ok = avg > 0 and avg1 is not None and avg1 > 0
-        out.append(f"  {key}: average {avg:+.3f}% vs holding at the end, "
+        out.append(f"  {key}: average {avg:+.3f}% vs holding at the end after {cost:.2f}% open/close costs, "
                    + (f"{avg1:+.3f}% at 24 h" if avg1 is not None else "no 24 h checkpoint")
                    + f" ({len(rr)} positions) -> rules 1-2 {'PASS' if ok else 'FAIL'}")
         if ok:
@@ -2365,7 +2371,7 @@ def lp_spread_lines(rows: list) -> list[str]:
     sp = lp_spread([r for _, r in rows])
     if not sp:
         return []
-    out = ["  SPREAD EVENLY (the realistic result: you can't know the winner in advance):"]
+    out = ["  SPREAD EVENLY (the realistic result: you can't know the winner in advance; after open/close costs):"]
     for rng, v in sp.items():
         label = {"5": "+/-5%", "20": "+/-20%", "5 auto": "+/-5% auto-rebalancing"}.get(rng, rng)
         out.append(f"    all {label} positions: average {v['avg_net_pct']:+.3f}% vs holding, {v['ahead']} of {v['n']} "

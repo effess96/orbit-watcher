@@ -27,8 +27,9 @@ def closes(start, daily, n=400, wobble=0.0):
 class FakeWeb:
     """Answers the URLs RegimeData asks for, in the real APIs' shapes."""
 
-    def __init__(self, binance_blocked=False, rate_limit_once=False):
+    def __init__(self, binance_blocked=False, rate_limit_once=False, no_hourly=False):
         self.calls, self.binance_blocked, self.rate_limit_once = [], binance_blocked, rate_limit_once
+        self.no_hourly = no_hourly
         coins = ["bitcoin", "ethereum", "tether", "solana", "ripple", "dogecoin", "cardano", "tron",
                  "chainlink", "avalanche-2", "sui", "wrapped-bitcoin"]
         self.markets = [{"id": c, "symbol": {"bitcoin": "btc", "ethereum": "eth", "solana": "sol"}.get(c, c[:4])}
@@ -46,6 +47,11 @@ class FakeWeb:
             return self.markets
         if "/market_chart" in url:
             cid = url.split("/coins/")[1].split("/")[0]
+            if "days=90" in url:                         # hourly request: each daily close held for 24 hours
+                if self.no_hourly:
+                    raise urllib.error.HTTPError(url, 429, "Too Many", {"Retry-After": "0"}, None)
+                return {"prices": [[(d * 24 + h) * 3_600_000, p] for d, p in enumerate(self.hist[cid][-100:])
+                                   for h in range(24)]}
             return {"prices": [[i, p] for i, p in enumerate(self.hist[cid])]}
         if url.endswith("/global"):
             return {"data": {"market_cap_percentage": {"btc": 57.3}}}
@@ -418,3 +424,49 @@ class DiskTests(unittest.TestCase):
                 app.prune_for_space()
             self.assertEqual([x["file"] for x in app.raw_index()], ["r1.jsonl.gz", "r2.jsonl.gz"])
             self.assertFalse((raw / "r0.jsonl.gz").exists())
+
+
+class V15Tests(unittest.TestCase):
+    def data(self, web, d):
+        return R.RegimeData(Path(d) / "cache", get=web, sleep=lambda x: None, delay=0, log=lambda m: None)
+
+    def test_weather_uses_hourly_prices_and_falls_back_to_daily(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = R.analyse(self.data(FakeWeb(), d), WATCHES)
+            bonk = next(t for t in m["tokens"] if t["watch"] == "Bonk")
+            self.assertEqual(bonk["vs_sol"].get("resolution"), "hourly")
+            self.assertEqual((bonk["weather_5"], bonk["weather_20"]), ("calm", "calm"))
+        with tempfile.TemporaryDirectory() as d:
+            m = R.analyse(self.data(FakeWeb(no_hourly=True), d), WATCHES)
+            bonk = next(t for t in m["tokens"] if t["watch"] == "Bonk")
+            self.assertIsNone(bonk["vs_sol"].get("resolution"))           # daily fallback still works
+            self.assertEqual(bonk["weather_20"], "calm")
+
+    def test_hourly_catches_an_intraday_spike_daily_misses(self):
+        hourly = [100.0] * (24 * 100)
+        for day in range(0, 100, 2):
+            hourly[day * 24 + 12] = 108.0                                  # +8% for one hour every other day
+        daily = hourly[23::24]
+        self.assertEqual(R.range_weather(daily)["in_3d_5"], 100.0)          # daily closes never see it
+        self.assertLess(R.range_weather_hourly(hourly)["in_3d_5"], 10.0)    # hourly does
+
+    def test_sliding_extremes(self):
+        mx, mn = R.sliding_extremes([3, 1, 4, 1, 5, 9, 2, 6], 3)
+        self.assertEqual((mx, mn), ([4, 4, 5, 9, 9, 9], [1, 1, 1, 1, 2, 2]))
+
+    def test_costs_are_taken_off_the_verdict_and_spread(self):
+        rows = [{"range_pct": 20, "strategy": "static", "hours": 73, "net_vs_hold_pct": 0.2,
+                 "day1_net_pct": 0.1, "cost_pct": 0.34, "vs_quote_pct": 0.2} for _ in range(8)]
+        out = "\n".join(W.lp_verdict(rows))
+        self.assertIn("-0.140% vs holding at the end after 0.34% open/close costs", out)
+        self.assertIn("RESULT: FAIL", out)                                # ahead before costs, behind after
+        sp = W.lp_spread(rows)["20"]
+        self.assertEqual((sp["avg_net_pct"], sp["avg_net_before_costs_pct"], sp["ahead"]), (-0.14, 0.2, 0))
+
+    def test_result_reports_cost(self):
+        import test_watcher as TW
+        pe = TW.PoolEarningsTests()
+        r = W.LpSim(pe.pool(), 0.05, 0.0).result()
+        expected = 100 * (W.LP_TX_COST_SOL + W.LP_CAPITAL_SOL * 0.003) / W.LP_CAPITAL_SOL
+        self.assertAlmostEqual(r["cost_pct"], round(expected, 4))
+        self.assertAlmostEqual(r["net_after_costs_pct"], round(r["net_vs_hold_pct"] - expected, 4), places=4)

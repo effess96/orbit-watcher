@@ -715,9 +715,16 @@ class App:
             w = watches[0]
             w["label"] = "NEW " + w["label"]
             w["auto_until"] = time.time() + h["minutes"] * 60
+            try:                                   # new tokens are where freezable / mintable ones hide
+                safe = W.token_safety(self.rpc_factory(http_url), mint)
+                w["safety"] = safe.get("level", "unknown")
+                why = f" ({'; '.join(safe['flags'][:2])})" if safe.get("flags") else ""
+            except Exception:
+                w["safety"], why = "unknown", ""
             added.append(w)
             self.hunter["recent"].appendleft({"time": time.strftime("%H:%M"), "name": p["name"],
-                                              "result": f"watching {len(w['pools'])} pools for {h['minutes']} min"})
+                                              "result": f"watching {len(w['pools'])} pools for {h['minutes']} min; "
+                                                        f"safety: {w['safety']}{why}"})
         if added:
             cfg = self.config()
             labels = {w["label"] for w in added}

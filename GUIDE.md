@@ -217,7 +217,7 @@ would take more than a year to pay back reads "never at this pace".
 python -m unittest test_watcher test_server test_regime
 ```
 
-120 offline tests run against a fake Solana server, fake CoinGecko/Binance/OKX and fake RPC answers, with no internet needed. They cover pool maths for every supported DEX, the WebSocket client, gap timing, paper positions and their guards, the auditor, market mood, token safety, health checks, archives, the dashboard's security, and a check that no trading code exists.
+125 offline tests run against a fake Solana server, fake CoinGecko/Binance/OKX and fake RPC answers, with no internet needed. They cover pool maths for every supported DEX, the WebSocket client, gap timing, paper positions and their guards, the auditor, market mood, token safety, health checks, archives, the dashboard's security, and a check that no trading code exists.
 
 ### Mac certificate error
 
