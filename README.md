@@ -13,7 +13,7 @@
 
 [What it found](#-what-it-found) · [Features](#-features) · [Architecture](#-architecture) · [Quick start](#-quick-start) · [Deploy](#-deploy-in-10-minutes) · [Full guide](GUIDE.md)
 
-<img src="screenshot-overview.png" alt="Orbit dashboard: overview tab" width="860">
+<img src="orbit-overview.png" alt="Orbit dashboard: overview tab" width="860">
 
 </div>
 
@@ -126,7 +126,7 @@ Runs 24/7 on [Railway](https://railway.app) using the included `Dockerfile` and 
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | optional | Alerts, daily summary, trouble notices |
 | `ORBIT_LP_CAPITAL_SOL` | optional | Capital used in the SOL-per-day figures (default 2.5) |
 
-<div align="center"><img src="screenshot-charts.png" alt="Orbit dashboard: charts tab" width="760"></div>
+<div align="center"><img src="orbit-charts.png" alt="Orbit dashboard: charts tab" width="760"></div>
 
 ## 🧪 Tests
 
