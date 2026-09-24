@@ -602,6 +602,8 @@ LP_RANGES = (0.05, 0.20)     # position ranges: price +/-5% and +/-20% around th
 LP_REBALANCE = (0.05,)       # also track these ranges as auto-rebalancing positions (Hummingbot-style)
 DAY1_S = 86400               # checkpoint used to test whether early leaders stay ahead
 VERDICT_HOURS = 72           # the test length the verdict rules below are judged on
+VERDICT_GRACE_H = 1.0        # if a straggler hasn't reached 72 h an hour after the oldest did, judge without it
+CHECKPOINT_EVERY_S = 10      # how often every position is checked for its 24 h / 72 h snapshot, quiet pools included
 REBALANCE_AFTER_S = 600      # re-center a rebalancing position after 10 minutes out of range
 LP_START_VALUE = 100.0       # paper position size, in the pool's quote (SOL or USDC)
 MAX_FEE_STEP = 0.01          # sanity cap: one update can add at most 1% of the position in fees
@@ -627,6 +629,7 @@ class LpSim:
         self.pool, self.width = pool, width
         self.rebalance, self.rebalances, self.rebalance_cost, self.out_since = rebalance, 0, 0.0, None
         self.day1 = None                          # "net vs holding" when the position turned 24 h old
+        self.day3 = None                          # "net vs holding" frozen when the position turned 72 h old
         if state:
             self.__dict__.update({k: v for k, v in state.items() if k not in ("pool", "width")})
             self.fg = tuple(self.fg)
@@ -634,6 +637,7 @@ class LpSim:
             self.slot = int(getattr(self, "slot", 0))
             self.worst = float(getattr(self, "worst", 0.0))
             self.best = float(getattr(self, "best", 0.0))
+            self.t_seen = float(getattr(self, "t_seen", self.t_last))
             if not self.sane():
                 raise ValueError("restored position is not sane")
             return
@@ -642,7 +646,7 @@ class LpSim:
         self.hold_tok, self.hold_quote = self._amounts(s0)
         self.fee_tok = self.fee_quote = 0.0
         self.fg, self.s_last = pool.fg, s0
-        self.t0 = self.t_last = t
+        self.t0 = self.t_last = self.t_seen = t
         self.in_range_s = 0.0
         self.skipped = 0
         self.slot = 0
@@ -704,8 +708,17 @@ class LpSim:
         self.fg, self.s_last, self.t_last, self.slot = p.fg, p.sq, t, slot or getattr(self, "slot", 0)
         if self.rebalance:
             self._maybe_rebalance(t)
-        if self.day1 is None and t - self.t0 >= DAY1_S:
+        self.checkpoint(t)
+
+    def checkpoint(self, now: float) -> None:
+        """Take the 24 h and 72 h snapshots on the clock, not only when this pool's price changes.
+        A quiet pool (no update for a while) still has a valid reading: nothing changed, so nothing new to count."""
+        self.t_seen = max(getattr(self, "t_seen", self.t_last), now)
+        age = self.t_seen - self.t0
+        if self.day1 is None and age >= DAY1_S:
             self.day1 = self._net_pct()
+        if getattr(self, "day3", None) is None and age >= VERDICT_HOURS * 3600:
+            self.day3 = self._net_pct()   # frozen: the verdict is judged on this, not on later drift
 
     def _net_pct(self) -> float:
         price = self.pool.price()
@@ -760,6 +773,8 @@ class LpSim:
                 "cost_pct": round(100 * cost / LP_CAPITAL_SOL, 4),        # opening + closing, as % of your capital
                 "net_after_costs_pct": round(net - 100 * cost / LP_CAPITAL_SOL, 4),
                 "day1_net_pct": None if self.day1 is None else round(self.day1, 4),
+                "day3_net_pct": None if getattr(self, "day3", None) is None else round(self.day3, 4),
+                "age_h": round((getattr(self, "t_seen", self.t_last) - self.t0) / 3600, 2),
                 "rebalance_cost_pct": round(pct(self.rebalance_cost), 4),
                 "in_range_now": self.sa <= self.pool.sq <= self.sb}
 
@@ -781,6 +796,7 @@ class LpBook:
         self.path, self.sims, self.saved = path, {}, {}
         self.restarted = 0
         self._last_save = 0.0
+        self._last_sweep = None
         if path and path.exists():
             try:
                 self.saved = json.loads(path.read_text(encoding="utf-8"))
@@ -806,8 +822,19 @@ class LpBook:
             if not sim.sane():                    # numbers went impossible: start this position again
                 self.sims[key] = LpSim(pool, width, t, rebalance=rb)
                 self.restarted += 1
+        if self._last_sweep is None or t - self._last_sweep >= CHECKPOINT_EVERY_S:
+            self.sweep(t)
         if self.path and time.monotonic() - self._last_save > 30:
             self.save()
+
+    def sweep(self, now: float) -> None:
+        """Give every position (quiet pools included) the chance to take its 24 h / 72 h snapshot."""
+        self._last_sweep = now
+        for sim in self.sims.values():
+            try:
+                sim.checkpoint(now)
+            except (ZeroDivisionError, TypeError, ValueError):
+                continue
 
     def summary(self) -> list[dict]:
         rows = []
@@ -2335,18 +2362,28 @@ def lp_verdict(results: list[dict]) -> list[str]:
       2. That same strategy was already ahead at the 24 h checkpoint (not one lucky late swing).
       3. Winners can be picked: the day-1 top quarter did better than the day-1 bottom quarter afterwards.
     All three must hold before real money is worth a small, capped trial."""
-    done = [r for r in results if r.get("hours", 0) >= VERDICT_HOURS]
-    out = ["", f"VERDICT (rules fixed in advance; judged on positions with {VERDICT_HOURS} h+ of data)"]
+    def final(r):          # each position's result frozen at exactly 72 h (older saved rows: their latest result)
+        return r["day3_net_pct"] if r.get("day3_net_pct") is not None else r["net_vs_hold_pct"]
+    age = lambda r: r.get("age_h", r.get("hours", 0)) or 0
+    done = [r for r in results if r.get("day3_net_pct") is not None
+            or ("day3_net_pct" not in r and r.get("hours", 0) >= VERDICT_HOURS)]
+    waiting = len(results) - len(done)
+    out = ["", f"VERDICT (rules fixed in advance; each position judged on its result frozen at exactly {VERDICT_HOURS} h)"]
+    oldest = max((age(r) for r in results), default=0)
     if not done:
-        have = max((r.get("hours", 0) for r in results), default=0)
-        return out + [f"  Pending: the oldest position has {have:.1f} of {VERDICT_HOURS} hours."]
+        return out + [f"  Pending: the oldest position has {oldest:.1f} of {VERDICT_HOURS} hours."]
+    if waiting and oldest < VERDICT_HOURS + VERDICT_GRACE_H:
+        return out + [f"  Pending: {len(done)} of {len(results)} positions have reached {VERDICT_HOURS} h; "
+                      "judging once all of them have, so the verdict is decided once, on the full set."]
+    if waiting:
+        out.append(f"  Note: {waiting} position(s) never reached {VERDICT_HOURS} h (restarted or started late) and are left out.")
     passed = []
     for key, rng, strat in (("+/-5%", 5, "static"), ("+/-20%", 20, "static"), ("+/-5% auto", 5, "rebalance")):
         rr = [r for r in done if r.get("range_pct") == rng and r.get("strategy", "static") == strat]
         if not rr:
             continue
         cost = statistics.mean(r.get("cost_pct", 0.0) for r in rr)     # opening + closing, paid once
-        avg = statistics.mean(r["net_vs_hold_pct"] for r in rr) - cost
+        avg = statistics.mean(final(r) for r in rr) - cost
         d1 = [r["day1_net_pct"] - r.get("cost_pct", 0.0) for r in rr if r.get("day1_net_pct") is not None]
         avg1 = statistics.mean(d1) if d1 else None
         ok = avg > 0 and avg1 is not None and avg1 > 0
@@ -2359,7 +2396,7 @@ def lp_verdict(results: list[dict]) -> list[str]:
     persist = None
     if len(ranked) >= 8:
         q = len(ranked) // 4
-        later = lambda g: statistics.mean(r["net_vs_hold_pct"] - r["day1_net_pct"] for r in g)
+        later = lambda g: statistics.mean(final(r) - r["day1_net_pct"] for r in g)
         top, bottom = later(ranked[-q:]), later(ranked[:q])
         persist = top > bottom
         out.append(f"  Rule 3: after day 1, the day-1 top quarter moved {top:+.3f}% and the bottom quarter {bottom:+.3f}% "

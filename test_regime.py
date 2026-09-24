@@ -332,6 +332,81 @@ class VerdictTests(unittest.TestCase):
         self.assertLess(r["vs_quote_pct"], r["net_vs_hold_pct"])                 # worse than keeping SOL
 
 
+class FrozenVerdictTests(unittest.TestCase):
+    """v1.6: results are frozen at exactly 72 h, quiet pools still get their snapshots, and the verdict waits
+    until every position has reached 72 h."""
+
+    @staticmethod
+    def pos(final, day1, day3, age=72.5, rng=20):
+        return {"range_pct": rng, "strategy": "static", "hours": age, "age_h": age,
+                "net_vs_hold_pct": final, "day1_net_pct": day1, "day3_net_pct": day3}
+
+    def test_verdict_uses_the_72h_snapshot_not_later_drift(self):
+        rows = [self.pos(final=-5.0, day1=0.5 + i * 0.1, day3=2 * (0.5 + i * 0.1)) for i in range(8)]
+        out = "\n".join(W.lp_verdict(rows))
+        self.assertIn("RESULT: PASS for +/-20%", out)          # judged at 72 h, the later -5% is ignored
+        self.assertIn("frozen at exactly 72 h", out)
+
+    def test_pending_until_every_position_has_reached_72h(self):
+        rows = [self.pos(1.0, 0.5, 1.0) for _ in range(7)] + [self.pos(1.0, 0.5, None, age=71.9)]
+        out = "\n".join(W.lp_verdict(rows))
+        self.assertIn("Pending: 7 of 8 positions", out)
+        self.assertNotIn("RESULT", out)
+
+    def test_straggler_is_left_out_after_the_grace_hour(self):
+        rows = [self.pos(1.0, 0.5 + i * 0.1, 1.0 + i * 0.3, age=73.5) for i in range(8)] \
+            + [self.pos(1.0, None, None, age=10.0)]
+        out = "\n".join(W.lp_verdict(rows))
+        self.assertIn("1 position(s) never reached 72 h", out)
+        self.assertIn("RESULT:", out)
+
+    def test_quiet_pool_gets_its_snapshots_from_the_clock(self):
+        import test_watcher as TW
+        pe = TW.PoolEarningsTests()
+        quiet, busy = pe.pool(), pe.pool()
+        quiet.address, busy.address = "quiet", "busy"
+        with tempfile.TemporaryDirectory() as d:
+            book = W.LpBook(Path(d) / "lp_state.json")
+            book.observe(quiet, 0.0, 1)
+            book.observe(busy, 0.0, 1)
+            book.observe(busy, W.DAY1_S + 5, 2)                    # only the busy pool updates
+            r = {x["address"] + str(x["range_pct"]): x for x in book.summary()}
+            self.assertIsNotNone(r["quiet5"]["day1_net_pct"])       # snapshot taken anyway
+            book.observe(busy, W.VERDICT_HOURS * 3600 + 5, 3)
+            r = {x["address"] + str(x["range_pct"]): x for x in book.summary()}
+            self.assertIsNotNone(r["quiet20"]["day3_net_pct"])
+            self.assertGreaterEqual(r["quiet20"]["age_h"], W.VERDICT_HOURS)
+            self.assertLess(r["quiet20"]["hours"], 1)              # its own last update is still at the start
+
+    def test_72h_snapshot_is_frozen_and_survives_restart(self):
+        import test_watcher as TW
+        pe = TW.PoolEarningsTests()
+        p = pe.pool()
+        sim = W.LpSim(p, 0.05, 0.0)
+        sim.observe(W.VERDICT_HOURS * 3600 + 1, 1)
+        frozen = sim.result()["day3_net_pct"]
+        self.assertIsNotNone(frozen)
+        pe.move(p, 0.97)
+        sim.observe(W.VERDICT_HOURS * 3600 + 500, 2)
+        r = sim.result()
+        self.assertEqual(r["day3_net_pct"], frozen)                # later moves don't change the snapshot
+        self.assertNotEqual(r["net_vs_hold_pct"], frozen)
+        again = W.LpSim(p, 0.05, 0.0, sim.state())
+        self.assertEqual(again.result()["day3_net_pct"], frozen)
+
+    def test_old_saved_positions_still_load(self):
+        import test_watcher as TW
+        pe = TW.PoolEarningsTests()
+        p = pe.pool()
+        old = W.LpSim(p, 0.05, 0.0).state()
+        for k in ("day3", "t_seen"):
+            old.pop(k)
+        sim = W.LpSim(p, 0.05, 0.0, old)
+        r = sim.result()
+        self.assertIsNone(r["day3_net_pct"])
+        self.assertEqual(r["age_h"], 0)
+
+
 class HealthTests(unittest.TestCase):
     def app(self, d):
         sent = []
