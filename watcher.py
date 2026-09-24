@@ -855,6 +855,7 @@ class Engine:
         self.last_slot = 0
         self.updates = 0
         self.dirty: set[int] = set()
+        self.reconnects: collections.deque = collections.deque(maxlen=200)   # times the data stream dropped
         self.stats = {"shocks": 0, "shock_gaps": 0, "dislocations": 0, "interrupted": 0,
                       "tradable": 0, "big_shocks": 0, "bin_steps": 0, "loops": 0}
         self.warned: set[str] = set()
@@ -998,6 +999,7 @@ class Engine:
 
     def interrupt(self) -> None:
         """Connection lost: open gaps can no longer be timed honestly, so drop them."""
+        self.reconnects.append(time.time())
         for w in self.watches:
             self.stats["interrupted"] += len(w.open) + len(w.loops)
             w.open.clear()

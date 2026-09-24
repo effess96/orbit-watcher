@@ -324,3 +324,60 @@ class VerdictTests(unittest.TestCase):
         sim.observe(W.DAY1_S + 100)
         r = sim.result()
         self.assertLess(r["vs_quote_pct"], r["net_vs_hold_pct"])                 # worse than keeping SOL
+
+
+class HealthTests(unittest.TestCase):
+    def app(self, d):
+        sent = []
+        app = S.App(Path(d), "x" * 12, notifier=S.Notifier(sender=lambda *a: sent.append(a)))
+        app.notifier.enabled = True
+        return app, sent
+
+    def test_all_checks_report_and_fresh_start_waits(self):
+        with tempfile.TemporaryDirectory() as d:
+            app, _ = self.app(d)
+            checks = {c["key"]: c for c in app.health_checks()}
+            for key in ("watcher", "data", "lag", "reconnects", "mood", "positions", "accuracy", "disk", "raw", "alerts"):
+                self.assertIn(key, checks)
+            self.assertEqual(checks["watcher"]["status"], "wait")          # just started: not a failure yet
+            self.assertEqual(checks["mood"]["status"], "wait")
+            self.assertEqual(checks["disk"]["status"], "ok")
+
+    def test_price_maths_drift_is_caught(self):
+        with tempfile.TemporaryDirectory() as d:
+            app, _ = self.app(d)
+            app.out.mkdir(parents=True, exist_ok=True)
+            rows = "".join(f"{i},whirlpool,{0.5 if i % 2 else 0.0}\n" for i in range(40))   # half the swaps 0.5% off
+            (app.out / "quote_checks.csv").write_text("n,kind,error_pct\n" + rows)
+            acc = next(c for c in app.health_checks() if c["key"] == "accuracy")
+            self.assertEqual(acc["status"], "fail")
+            self.assertIn("50%", acc["detail"])
+
+    def test_failing_check_alerts_once_then_recovers(self):
+        with tempfile.TemporaryDirectory() as d:
+            app, sent = self.app(d)
+
+            class E:
+                updates, reconnects = 5, [time_now() - 10 for _ in range(S.RECONNECT_FAIL)]
+                watches, lp = [], type("L", (), {"sims": {}, "restarted": 0})()
+                def latency_stats(self):
+                    return None
+            app.engine = E()
+            with contextlib.redirect_stdout(io.StringIO()):
+                app.check_health()
+                app.check_health()
+            msgs = [str(m) for m in sent if "Connection" in str(m)]
+            self.assertEqual(len(msgs), 1)                                     # one alert, not one every 30 s
+            E.reconnects = []
+            with contextlib.redirect_stdout(io.StringIO()):
+                app.check_health()
+            self.assertTrue(any("recovered: Connection" in str(m) for m in sent))
+
+    def test_memory_reading(self):
+        m = S.memory_mb()
+        self.assertTrue(m is None or m > 0)
+
+
+def time_now():
+    import time
+    return time.time()

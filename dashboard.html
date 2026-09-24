@@ -371,6 +371,13 @@ tbody tr:hover td{background:var(--panel-2)}
 
   <div class="tab" data-tab="setup">
   <section>
+    <h2>System health <span class="note" id="health-sum"></span></h2>
+    <div class="scroll"><table><thead><tr><th></th><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody id="health-rows"></tbody></table></div>
+    <div id="health-empty" class="empty">Waiting for the first reading.</div>
+    <p class="note">Checked every 30 seconds. Any check that turns to "fail" sends a Telegram message, and another when it recovers. "Wait" is normal for the first few minutes after a restart.</p>
+  </section>
+
+  <section>
     <h2>Watches <button id="w-expand">Expand all</button> <button id="w-collapse">Collapse all</button></h2>
     <div id="watches"></div>
     <p class="note">Costs, minimum profit and fees are your assumptions. Saving restarts the watcher; gaps open at that moment are dropped, not mistimed.</p>
@@ -746,6 +753,21 @@ function renderMoney(s) {
     + `"vs just holding" is only what providing liquidity added or cost. Costs to open and close are not yet taken off.`;
 }
 
+const HICON = {ok: "✓", warn: "!", fail: "✗", wait: "…"}, HLABEL = {ok: "OK", warn: "Check", fail: "Problem", wait: "Starting"};
+function renderHealth(s) {
+  const hc = s.health || [], col = {ok: cssv("--good"), warn: cssv("--warning"), fail: cssv("--critical"), wait: cssv("--muted")};
+  const n = st => hc.filter(c => c.status === st).length;
+  const icon = st => { const b = el("b", {text: HICON[st] + " "}); b.style.color = col[st]; return b; };
+  const bad = hc.filter(c => c.status !== "ok");
+  const head = el("div", {}, icon(n("fail") ? "fail" : n("warn") ? "warn" : n("wait") ? "wait" : "ok"),
+    el("b", {text: n("fail") ? `${n("fail")} problem(s)` : n("warn") ? `${n("warn")} thing(s) to check` : n("wait") ? "Starting up" : `All ${hc.length} checks OK`}));
+  const lines = (bad.length ? bad : hc.slice(0, 5)).slice(0, 6).map(c => el("div", {}, icon(c.status), `${c.name}: ${c.detail}`));
+  $("health").replaceChildren(head, ...lines, el("div", {class: "note", text: "Full list: Setup & data tab."}));
+  $("health-sum").textContent = hc.length ? `${n("ok")} of ${hc.length} OK` : "";
+  renderTable("health-rows", "health-empty", hc, c => [icon(c.status), c.name,
+    (() => { const b = el("b", {text: HLABEL[c.status]}); b.style.color = col[c.status]; return b; })(), c.detail]);
+}
+
 function renderStatus(s) {
   const lp = (s.lp || []).filter(r => r.hours > 0), good = cssv("--good"), bad = cssv("--critical"), warn = cssv("--warning");
   const hrs = lp.length ? Math.max(...lp.map(r => r.hours)) : 0;
@@ -757,16 +779,7 @@ function renderStatus(s) {
     return d; }) : [el("div", {class: "muted", text: "Waiting for data."})]));
   if (v.length && /Pending/.test(v[1] || "")) $("verdict").append(el("div", {class: "note",
     text: "Pass needs all three: a strategy ahead of holding when spread over every position, already ahead at 24 h, and day-1 leaders that keep leading."}));
-  const h = s.history || []; let live = 0; for (let i = 1; i < h.length; i++) if (h[i].updates > h[i - 1].updates) live++;
-  const flow = h.length > 1 ? live / (h.length - 1) : 0, moodAge = s.mood ? (Date.now() / 1000 - s.mood.t) / 3600 : null;
-  const row = (ok, text) => { const d = el("div", {}, el("b", {text: ok === null ? "… " : ok ? "✓ " : "✗ "}), text);
-    d.firstChild.style.color = ok === null ? warn : ok ? good : bad; return d; };
-  $("health").replaceChildren(
-    row(s.state === "running", `Watcher ${s.state}, up ${dur(s.uptime_s)}`),
-    row(h.length > 1 ? flow >= 0.9 : null, `Data flowing ${fmt(flow * 100, 0)}% of the last hour`),
-    row(s.latency ? s.latency.median_slots <= 1 : null, `Behind chain tip: ${s.latency ? s.latency.median_slots + " slot(s)" : "–"}`),
-    row(moodAge === null ? null : moodAge < 7, `Market mood ${moodAge === null ? "not read yet" : "updated " + fmt(moodAge, 1) + " h ago"}`),
-    row(s.alerts_enabled, `Telegram alerts ${s.alerts_enabled ? "on (you'll hear about trouble)" : "off"}`));
+  renderHealth(s);
 }
 
 let tab = "overview";

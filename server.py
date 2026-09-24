@@ -54,11 +54,25 @@ DOWNLOADS = {"dislocations.csv": "text/csv", "shocks.csv": "text/csv", "loops.cs
              "raw_updates.jsonl": "application/x-ndjson"}
 BUNDLE_FILES = ("dislocations.csv", "shocks.csv", "loops.csv", "closers.csv", "quote_checks.csv",
                 "lp_state.json", "latency.json", "regime.json", "regime_log.jsonl")
+DISK_WARN_MB, DISK_FAIL_MB = 1000, 300   # free space left on the data volume
+MEMORY_WARN_MB = 700
+RECONNECT_WARN, RECONNECT_FAIL = 3, 10   # stream drops in the last hour
 STALL_ALERT_S = 600              # Telegram alert when no pool update arrives for this long
 MOOD_FAILS_ALERT = 3             # ...or when the market-mood job fails this many times in a row
 MOOD_EVERY_S = 6 * 3600          # market mood refresh (heavy fetches happen once a day; the rest hit the cache)
 ARCHIVE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 SECRET_IN_TEXT = re.compile(r"(api[-_]?key=)[^&\s\"']+|(bot)\d+:[A-Za-z0-9_-]+", re.I)
+
+
+def memory_mb() -> float | None:
+    """Resident memory of this process in MB (Linux), None elsewhere."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024
+    except OSError:
+        return None
+    return None
 
 
 def redact(text: str) -> str:
@@ -707,6 +721,102 @@ class App:
                 raw.stat().st_size > RAW_ROTATE_BYTES or time.time() - self.raw_started > RAW_ROTATE_HOURS * 3600):
             self.rotate_raw()
 
+    def health_checks(self, now: float | None = None) -> list[dict]:
+        """Every health check in one place: name, status (ok / warn / fail / wait) and a plain-words detail.
+        The dashboard shows all of them; Telegram hears about any that turn to 'fail' (and when they recover)."""
+        now = now or time.time()
+        e, out = self.engine, []
+        add = lambda key, name, status, detail: out.append({"key": key, "name": name, "status": status, "detail": detail})
+        up = now - self.started
+        # 1. watcher running
+        run = self.state == "running"
+        add("watcher", "Watcher", "ok" if run else "wait" if up < 120 else "fail",
+            f"{self.state}, up {int(up // 3600)} h {int(up % 3600 // 60)} min")
+        # 2. data flowing (updates keep arriving)
+        quiet = now - self.watchdog["since"]
+        add("data", "Data stream", "ok" if quiet < 120 else "warn" if quiet < STALL_ALERT_S else "fail",
+            f"{e.updates:,} pool updates; last new data {int(quiet)} s ago" if e else "not started")
+        # 3. speed
+        lat = e.latency_stats() if e else None
+        if lat:
+            m = lat["median_slots"]
+            add("lag", "Speed", "ok" if m <= 1 else "warn" if m <= 3 else "fail", f"median {m} slot(s) behind the chain tip")
+        else:
+            add("lag", "Speed", "wait", "measuring")
+        # 4. stream drops
+        drops = sum(1 for t in (e.reconnects if e else []) if now - t < 3600)
+        add("reconnects", "Connection", "ok" if drops < RECONNECT_WARN else "warn" if drops < RECONNECT_FAIL else "fail",
+            f"{drops} reconnect(s) in the last hour")
+        # 5. market mood fresh
+        age = (now - self.mood["t"]) / 3600 if self.mood else None
+        if age is None:
+            add("mood", "Market mood", "wait" if up < 1800 else "fail", self.mood_status.get("error") or "no reading yet")
+        else:
+            st = "ok" if age < 7 else "warn" if age < 13 else "fail"
+            if self.mood_status.get("fails", 0) >= MOOD_FAILS_ALERT:
+                st = "fail"
+            add("mood", "Market mood", st, f"updated {age:.1f} h ago" + (f"; last error: {self.mood_status['error']}"
+                                                                       if self.mood_status.get("error") else ""))
+        # 6. paper positions being saved
+        lp_file = self.out / "lp_state.json"
+        if e and e.lp.sims:
+            saved = now - lp_file.stat().st_mtime if lp_file.exists() else 1e9
+            add("positions", "Earnings tracking", "ok" if saved < 300 else "warn" if saved < 1800 else "fail",
+                f"{len(e.lp.sims)} paper positions, saved {int(saved)} s ago"
+                + (f"; {e.lp.restarted} restarted after odd readings" if e.lp.restarted else ""))
+        else:
+            add("positions", "Earnings tracking", "wait" if up < 600 else "warn", "no positions yet")
+        # 7. price maths still matches real swaps (catches a DEX changing its data layout)
+        _, _, checks = self._audit_cache if self._audit_cache[0] else (0, [], W.read_csv(self.out / "quote_checks.csv"))
+        errs = [abs(float(c["error_pct"])) for c in checks[-100:] if c.get("error_pct") not in (None, "")]
+        if len(errs) >= 20:
+            good = sum(x <= 0.1 for x in errs) / len(errs)
+            add("accuracy", "Price maths", "ok" if good >= 0.9 else "warn" if good >= 0.75 else "fail",
+                f"{good:.0%} of the last {len(errs)} real swaps re-priced within 0.1%")
+        else:
+            add("accuracy", "Price maths", "wait", f"{len(errs)} of 20 swaps needed for a reading")
+        # 8. background lookups alive
+        if self.auditor:
+            last = now - self.auditor._last_check if self.auditor._last_check else None
+            errs_n = self.auditor.stats.get("errors", 0)
+            st = "ok" if last is not None and last < 300 else "wait" if up < 300 else "warn"
+            add("auditor", "Transaction lookups", st,
+                (f"last check {int(last)} s ago" if last is not None else "not started") + f"; {errs_n} error(s) since start")
+        # 9. idle pools
+        if e:
+            pools = [p for w in e.watches for p in w.pools]
+            idle = [p for p in pools if now - p.last_update > 7200]
+            add("pools", "Pools", "ok" if len(idle) <= len(pools) // 3 else "warn",
+                f"{len(pools) - len(idle)} of {len(pools)} pools updated in the last 2 h"
+                + (f"; quiet: {', '.join(p.name for p in idle[:4])}" if idle else ""))
+        # 10. disk space on the volume
+        try:
+            free = shutil.disk_usage(self.out if self.out.exists() else self.dir).free / 1e6
+            add("disk", "Disk space", "ok" if free >= DISK_WARN_MB else "warn" if free >= DISK_FAIL_MB else "fail",
+                f"{free:,.0f} MB free")
+        except OSError:
+            pass
+        # 11. raw data compression keeping up
+        raw = self.out / "raw_updates.jsonl"
+        size = raw.stat().st_size / 1e6 if raw.exists() else 0
+        add("raw", "Raw data", "ok" if size < 2 * RAW_ROTATE_BYTES / 1e6 else "fail",
+            f"current file {size:.0f} MB; compressed every {RAW_ROTATE_HOURS} h")
+        # 12. memory
+        rss = memory_mb()
+        if rss is not None:
+            add("memory", "Memory", "ok" if rss < MEMORY_WARN_MB else "warn", f"{rss:.0f} MB in use")
+        # 13. alerts
+        add("alerts", "Telegram alerts", ("ok" if not self.notifier.errors else "warn") if self.notifier.enabled else "warn",
+            ("on" if self.notifier.enabled else "off: you won't hear about trouble")
+            + (f"; {self.notifier.errors} failed send(s)" if self.notifier.errors else ""))
+        return out
+
+    def safe_health(self) -> list[dict]:
+        try:
+            return self.health_checks()
+        except Exception as err:
+            return [{"key": "health", "name": "Health checks", "status": "warn", "detail": f"could not run: {type(err).__name__}"}]
+
     def check_health(self, now: float | None = None) -> None:
         """Telegram 'trouble' alerts: data stream stalled, or the market-mood job keeps failing. Once each, plus
         a recovery message."""
@@ -728,6 +838,23 @@ class App:
             wd["mood_alerted"] = True
             self.notifier.send(f"Orbit trouble: market mood failed {self.mood_status['fails']} times in a row "
                                f"({self.mood_status.get('error', '')}).", force=True)
+        # every other check: one message when it turns to 'fail', one when it is fine again
+        failing = wd.setdefault("failing", set())
+        try:
+            checks = self.health_checks(now)
+        except Exception as err:                         # a broken check must never stop the watchdog
+            print(f"Health checks failed to run: {type(err).__name__}: {err}", flush=True)
+            checks = []
+        for c in checks:
+            if c["key"] in ("data", "mood"):
+                continue                                   # handled above with their own wording
+            if c["status"] == "fail" and c["key"] not in failing:
+                failing.add(c["key"])
+                self.notifier.send(f"Orbit trouble: {c['name']}: {c['detail']}", force=True)
+                print(f"Health: {c['name']} failing: {c['detail']}", flush=True)
+            elif c["status"] in ("ok", "warn") and c["key"] in failing:
+                failing.discard(c["key"])
+                self.notifier.send(f"Orbit recovered: {c['name']}: {c['detail']}", force=True)
 
     # -- auth -----------------------------------------------------------------
     def check_password(self, pw: str) -> bool:
@@ -788,6 +915,7 @@ class App:
             "lp": (lp := self.lp_rows()),
             "lp_spread": W.lp_spread(lp),
             "capital_sol": W.LP_CAPITAL_SOL,
+            "health": self.safe_health(),
             "verdict": W.lp_verdict(lp)[1:],
             "mood": self.mood, "mood_status": self.mood_status,
             "audit": self.audit_summary(),
