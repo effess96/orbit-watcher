@@ -1884,6 +1884,10 @@ MIN_LIQUIDITY_USD = 10_000  # smaller pools are usually abandoned: their "gaps" 
 
 
 TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+STAKE_POOL_TOKENS = {"J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",   # JitoSOL
+                     "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",    # mSOL
+                     "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",    # bSOL
+                     "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v"}    # JupSOL
 RISKY_EXTENSIONS = {"permanentDelegate": "issuer can move anyone's tokens",
                     "transferHook": "custom code runs on every transfer",
                     "transferFeeConfig": "a fee is taken on every transfer",
@@ -1901,7 +1905,9 @@ def token_safety(rpc, mint: str, known_vaults: set[str] | None = None) -> dict:
         return {"mint": mint, "error": "not a readable token mint"}
     supply = int(parsed.get("supply") or 0)
     flags = []
-    if parsed.get("mintAuthority"):
+    if parsed.get("mintAuthority") and mint in STAKE_POOL_TOKENS:
+        pass            # staking tokens are minted by their stake pool when SOL is deposited: expected, not a risk
+    elif parsed.get("mintAuthority"):
         flags.append("mint authority active: more tokens can be created")
     if parsed.get("freezeAuthority"):
         flags.append("freeze authority active: holders' tokens can be frozen")

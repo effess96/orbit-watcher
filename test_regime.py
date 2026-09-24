@@ -470,3 +470,10 @@ class V15Tests(unittest.TestCase):
         expected = 100 * (W.LP_TX_COST_SOL + W.LP_CAPITAL_SOL * 0.003) / W.LP_CAPITAL_SOL
         self.assertAlmostEqual(r["cost_pct"], round(expected, 4))
         self.assertAlmostEqual(r["net_after_costs_pct"], round(r["net_vs_hold_pct"] - expected, 4), places=4)
+
+
+class StakeTokenTests(unittest.TestCase):
+    def test_staking_tokens_mint_authority_is_expected(self):
+        r = W.token_safety(FakeMintRpc(mint_auth="StakePoolPDA"), "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn")
+        self.assertEqual(r["level"], "ok")
+        self.assertEqual(W.token_safety(FakeMintRpc(mint_auth="X"), "other")["level"], "risky")
