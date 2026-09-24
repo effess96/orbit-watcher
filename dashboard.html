@@ -1112,7 +1112,7 @@ async function loadArchives() {
       el("a", {href: `/download/archive/raw/${encodeURIComponent(r.file)}`, text: "Download"})]);
     const used = a.raw.reduce((x, r) => x + r.bytes, 0);
     $("arc-raw-note").textContent = `Current file ${bytes(a.raw_live_bytes)} (compressed every ${a.rotate_hours} h). `
-      + `Archive uses ${bytes(used)} of ${fmt(a.raw_keep_mb, 0)} MB; the oldest files are removed past that.`;
+      + `Archive uses ${bytes(used)} of ${fmt(a.raw_keep_mb, 0)} MB; the oldest files are removed past that, or whenever the disk gets low.`;
   } catch (e) { $("arc-raw-note").textContent = e.message; }
 }
 $("arc-save").addEventListener("click", async e => {

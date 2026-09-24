@@ -48,13 +48,14 @@ ROOT = Path(__file__).resolve().parent
 SESSION_HOURS = 12
 RAW_ROTATE_BYTES = 64 * 1024 * 1024                 # move the raw log aside at this size...
 RAW_ROTATE_HOURS = 6                                # ...or this age, then gzip it (about 7x smaller)
-RAW_KEEP_MB = float(os.environ.get("ORBIT_RAW_KEEP_MB", 1000))   # oldest compressed raw files go past this
+RAW_KEEP_MB = float(os.environ.get("ORBIT_RAW_KEEP_MB", 150))    # oldest compressed raw files go past this
+RAW_MIN_FREE_MB = 150                               # ...or whenever the volume has less free space than this
 DOWNLOADS = {"dislocations.csv": "text/csv", "shocks.csv": "text/csv", "loops.csv": "text/csv",
              "closers.csv": "text/csv", "quote_checks.csv": "text/csv",
              "raw_updates.jsonl": "application/x-ndjson"}
 BUNDLE_FILES = ("dislocations.csv", "shocks.csv", "loops.csv", "closers.csv", "quote_checks.csv",
                 "lp_state.json", "latency.json", "regime.json", "regime_log.jsonl")
-DISK_WARN_MB, DISK_FAIL_MB = 1000, 300   # free space left on the data volume
+DISK_WARN_MB, DISK_FAIL_MB = 250, 100    # free space left on the data volume (also judged as a share of it)
 MEMORY_WARN_MB = 700
 RECONNECT_WARN, RECONNECT_FAIL = 3, 10   # stream drops in the last hour
 STALL_ALERT_S = 600              # Telegram alert when no pool update arrives for this long
@@ -512,6 +513,31 @@ class App:
         except (OSError, ValueError):
             return []
 
+    def free_mb(self) -> float:
+        try:
+            return shutil.disk_usage(self.out if self.out.exists() else self.dir).free / 1e6
+        except OSError:
+            return 1e9
+
+    def prune_for_space(self) -> None:
+        """Keep the volume from filling up: drop the oldest compressed raw files, then the oldest saved reports
+        (never the newest two), until RAW_MIN_FREE_MB is free."""
+        if self.free_mb() >= RAW_MIN_FREE_MB:
+            return
+        with self.raw_lock:
+            idx = self.raw_index()
+            while idx and self.free_mb() < RAW_MIN_FREE_MB:
+                old = idx.pop(0)
+                (self.archive / "raw" / old["file"]).unlink(missing_ok=True)
+                print(f"Low disk: removed raw archive {old['file']}", flush=True)
+            (self.archive / "raw").mkdir(parents=True, exist_ok=True)
+            (self.archive / "raw" / "index.json").write_text(json.dumps(idx), encoding="utf-8")
+        reports = sorted((self.archive / "reports").glob("*")) if (self.archive / "reports").exists() else []
+        while len(reports) > 2 and self.free_mb() < RAW_MIN_FREE_MB:
+            old = reports.pop(0)
+            shutil.rmtree(old, ignore_errors=True)
+            print(f"Low disk: removed saved report {old.name}", flush=True)
+
     def rotate_raw(self, wait: bool = False) -> None:
         """Move the raw log aside and gzip it in the background, so the live file stays small."""
         if not self.recorder:
@@ -548,13 +574,14 @@ class App:
                         "hours": round((last - first) / 3600, 4) if count > 1 else 0.0})
             total = sum((self.archive / "raw" / x["file"]).stat().st_size
                         for x in idx if (self.archive / "raw" / x["file"]).exists())
-            while len(idx) > 1 and total > RAW_KEEP_MB * 1024 * 1024:
+            while len(idx) > 1 and (total > RAW_KEEP_MB * 1024 * 1024 or self.free_mb() < RAW_MIN_FREE_MB):
                 old = idx.pop(0)
                 f = self.archive / "raw" / old["file"]
                 if f.exists():
                     total -= f.stat().st_size
                     f.unlink()
-                print(f"Raw archive: removed oldest file {old['file']} to stay under {RAW_KEEP_MB:g} MB", flush=True)
+                print(f"Raw archive: removed oldest file {old['file']} (keeping under {RAW_KEEP_MB:g} MB "
+                      f"and {RAW_MIN_FREE_MB} MB free)", flush=True)
             tmp = self.archive / "raw" / "index.tmp"
             tmp.write_text(json.dumps(idx), encoding="utf-8")
             tmp.replace(self.archive / "raw" / "index.json")
@@ -710,6 +737,7 @@ class App:
             self.last_daily = time.time()
             self.notifier.send("Orbit daily summary\n" + "\n".join(W.report(self.out).splitlines()[2:16]), force=True)
         self.check_health()
+        self.prune_for_space()
         if time.time() - self.last_archive >= 86400:          # one automatic copy a day, no button needed
             self.last_archive = time.time()
             try:
@@ -760,9 +788,12 @@ class App:
         # 6. paper positions being saved
         lp_file = self.out / "lp_state.json"
         if e and e.lp.sims:
-            saved = now - lp_file.stat().st_mtime if lp_file.exists() else 1e9
-            add("positions", "Earnings tracking", "ok" if saved < 300 else "warn" if saved < 1800 else "fail",
-                f"{len(e.lp.sims)} paper positions, saved {int(saved)} s ago"
+            if lp_file.exists():
+                saved = now - lp_file.stat().st_mtime
+                st, when = ("ok" if saved < 300 else "warn" if saved < 1800 else "fail"), f"saved {int(saved)} s ago"
+            else:                                         # just started or just reset: first save comes within 30 s
+                st, when = "wait", "first save due within a minute"
+            add("positions", "Earnings tracking", st, f"{len(e.lp.sims)} paper positions, {when}"
                 + (f"; {e.lp.restarted} restarted after odd readings" if e.lp.restarted else ""))
         else:
             add("positions", "Earnings tracking", "wait" if up < 600 else "warn", "no positions yet")
@@ -791,9 +822,11 @@ class App:
                 + (f"; quiet: {', '.join(p.name for p in idle[:4])}" if idle else ""))
         # 10. disk space on the volume
         try:
-            free = shutil.disk_usage(self.out if self.out.exists() else self.dir).free / 1e6
-            add("disk", "Disk space", "ok" if free >= DISK_WARN_MB else "warn" if free >= DISK_FAIL_MB else "fail",
-                f"{free:,.0f} MB free")
+            du = shutil.disk_usage(self.out if self.out.exists() else self.dir)
+            free, share = du.free / 1e6, du.free / du.total
+            st = "fail" if free < DISK_FAIL_MB or share < 0.10 else "warn" if free < DISK_WARN_MB or share < 0.25 else "ok"
+            add("disk", "Disk space", st, f"{free:,.0f} MB free of {du.total / 1e6:,.0f} MB ({share:.0%}); "
+                f"old raw data is trimmed automatically below {RAW_MIN_FREE_MB} MB free")
         except OSError:
             pass
         # 11. raw data compression keeping up

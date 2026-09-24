@@ -1211,9 +1211,17 @@ class Engine:
         shows a gap nobody can trade; the dashboard leaves them out, detection does not."""
         return not p.suspect and (not active_only or time.time() - p.last_update < IDLE_POOL_S)
 
+    def display_price(self, w: Watch, p: "Pool") -> float | None:
+        """Price for the live gap readings: in SOL, or in the shared quote when every pool uses the same one
+        (e.g. SOL/USDC pools, which cannot be converted to SOL). Gap % is the same either way."""
+        px = self.to_sol(w, p)
+        if px is None and p.ready() and len({q.quote_mint for q in w.pools}) == 1:
+            px = p.price()
+        return px
+
     def best_net_gap_pct(self, w: Watch, active_only: bool = False) -> float | None:
         """Largest price gap between any two pools right now, after both fees (and the SOL/USDC fee)."""
-        pools = [(p, px) for p in w.pools if self.pool_live(p, active_only) and (px := self.to_sol(w, p))]
+        pools = [(p, px) for p in w.pools if self.pool_live(p, active_only) and (px := self.display_price(w, p))]
         best = None
         for i in range(len(pools)):
             for j in range(i + 1, len(pools)):
@@ -1224,7 +1232,7 @@ class Engine:
         return None if best is None else best * 100
 
     def max_gap_pct(self, w: Watch, active_only: bool = False) -> float | None:
-        prices = [s for p in w.pools if self.pool_live(p, active_only) and (s := self.to_sol(w, p))]
+        prices = [s for p in w.pools if self.pool_live(p, active_only) and (s := self.display_price(w, p))]
         if len(prices) < 2:
             return None
         return (max(prices) / min(prices) - 1) * 100

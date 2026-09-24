@@ -341,7 +341,8 @@ class HealthTests(unittest.TestCase):
                 self.assertIn(key, checks)
             self.assertEqual(checks["watcher"]["status"], "wait")          # just started: not a failure yet
             self.assertEqual(checks["mood"]["status"], "wait")
-            self.assertEqual(checks["disk"]["status"], "ok")
+            self.assertIn(checks["disk"]["status"], ("ok", "warn", "fail"))        # depends on this machine's disk
+            self.assertIn("MB free of", checks["disk"]["detail"])
 
     def test_price_maths_drift_is_caught(self):
         with tempfile.TemporaryDirectory() as d:
@@ -381,3 +382,39 @@ class HealthTests(unittest.TestCase):
 def time_now():
     import time
     return time.time()
+
+
+class SolWatchTests(unittest.TestCase):
+    def test_all_usdc_watch_shows_a_gap(self):
+        import test_watcher as TW
+        cfg = TW.config()
+        w0 = cfg["watches"][0]
+        w0["quote_mint"], w0["quote_decimals"] = R.USDC, 6              # every pool priced in USDC, no SOL ref
+        with tempfile.TemporaryDirectory() as d:
+            rec = W.Recorder(Path(d), keep_raw=False)
+            e = W.Engine(cfg, rec)
+            w = e.watches[0]
+            a, b = w.pools
+            a.base, a.quote, b.base, b.quote = 10 ** 12, 10 ** 12, 10 ** 12, 11 * 10 ** 11
+            self.assertIsNone(e.to_sol(w, a))                            # cannot be converted to SOL...
+            self.assertAlmostEqual(e.max_gap_pct(w), 10.0, places=6)     # ...but the gap still shows
+            rec.close()
+
+
+class DiskTests(unittest.TestCase):
+    def test_low_disk_trims_oldest_raw_first(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            app = S.App(Path(d), "x" * 12)
+            raw = app.archive / "raw"
+            raw.mkdir(parents=True)
+            idx = []
+            for i in range(3):
+                (raw / f"r{i}.jsonl.gz").write_bytes(b"x")
+                idx.append({"file": f"r{i}.jsonl.gz", "updates": 1, "hours": 1})
+            (raw / "index.json").write_text(json.dumps(idx))
+            free = lambda self: 100 if (raw / "r0.jsonl.gz").exists() else 200    # low until the oldest is gone
+            with mock.patch.object(S.App, "free_mb", free), contextlib.redirect_stdout(io.StringIO()):
+                app.prune_for_space()
+            self.assertEqual([x["file"] for x in app.raw_index()], ["r1.jsonl.gz", "r2.jsonl.gz"])
+            self.assertFalse((raw / "r0.jsonl.gz").exists())
