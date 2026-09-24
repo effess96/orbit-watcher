@@ -135,6 +135,7 @@ tbody tr:hover td{background:var(--panel-2)}
 .money table td,.money table th{padding:8px 10px}
 .money .amt{font-weight:650}
 @media (max-width:760px){.money{grid-template-columns:1fr}header{padding:12px 16px}}
+#arb-hist summary{cursor:pointer;font-weight:600}
 </style>
 </head>
 <body>
@@ -308,7 +309,8 @@ tbody tr:hover td{background:var(--panel-2)}
   <section>
     <h2>Arbitrage by token</h2>
     <div class="scroll"><table><thead><tr><th>Token</th><th>Gaps seen</th><th>Tradable</th><th>Closed within 1 slot</th><th>Median time open</th><th>Best 2.5 SOL round trip</th></tr></thead>
-      <tbody id="arb"></tbody></table></div>
+      <tbody id="arb"></tbody></table></div><details id="arb-hist" class="mt"><summary class="note" id="arb-past"></summary>
+      <div class="scroll"><table><thead><tr><th>Token</th><th>Gaps seen</th><th>Tradable</th><th>Closed within 1 slot</th><th>Median time open</th><th>Best 2.5 SOL round trip</th></tr></thead><tbody id="arb-old"></tbody></table></div><div id="arb-old-empty" class="empty"></div></details>
     <div id="arb-empty" class="empty">No gaps yet.</div>
     <p class="note">"Closed within 1 slot" means a faster bot took it before a home setup could act.</p>
   </section>
@@ -923,7 +925,17 @@ function renderInsights(s) {
     {digits: 1, tickDigits: 0, label: "Market speed"});
   lineChart($("c-lp"), names.map((n, i) => ({name: n, color: SERIES[i % 8],
     pts: h.filter(p => p.lp && p.lp[n] !== undefined).map(p => [p.t, p.lp[n]])})), {unit: "%", ref: 0, label: "Net vs holding over time", tickDigits: 3});
-  renderTable("arb", "arb-empty", (s.rates && s.rates.by_watch) || [], r => [r.watch, r.gaps,
+  const nowW = new Set((s.watches || []).map(w => w.label.trim())), allArb = (s.rates && s.rates.by_watch) || [];
+  const past = allArb.filter(r => !nowW.has(r.watch.trim()));
+  $("arb-hist").style.display = past.length ? "" : "none";
+  $("arb-past").textContent = `History: ${past.length} token(s) no longer watched (mostly the hunter's temporary ones), `
+    + `${past.reduce((a, r) => a + r.gaps, 0)} gaps. Click to show.`;
+  const arbRow = r => [r.watch, r.gaps,
+    el("span", {class: r.tradable ? "pos" : "", text: String(r.tradable)}),
+    `${r.within_1_slot} of ${r.gaps}`, r.median_slots === null ? "–" : `${r.median_slots} slots`,
+    r.best_depth_sol === null ? "unknown (Meteora)" : el("span", {class: r.best_depth_sol > 0 ? "pos" : "neg", text: `${fmt(r.best_depth_sol, 4)} SOL`})];
+  renderTable("arb-old", "arb-old-empty", past, arbRow);
+  renderTable("arb", "arb-empty", allArb.filter(r => nowW.has(r.watch.trim())), r => [r.watch, r.gaps,
     el("span", {class: r.tradable ? "pos" : "", text: String(r.tradable)}),
     `${r.within_1_slot} of ${r.gaps}`, r.median_slots === null ? "–" : `${r.median_slots} slots`,
     r.best_depth_sol === null ? "unknown (Meteora)" : el("span", {class: r.best_depth_sol > 0 ? "pos" : "neg", text: `${fmt(r.best_depth_sol, 4)} SOL`})]);
