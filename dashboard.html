@@ -14,6 +14,11 @@ header .sub{color:var(--muted);letter-spacing:.06em;font-size:12px}
 .spacer{flex:1}
 .pill{padding:3px 10px;border-radius:99px;font-size:12px;border:1px solid var(--line);color:var(--muted)}
 .pill.ok{color:var(--green);border-color:#1f5c43}.pill.warn{color:var(--amber);border-color:#5c4a1f}
+.tabbar{position:sticky;top:0;z-index:5;display:flex;gap:4px;flex-wrap:wrap;background:var(--bg);padding:10px 0 12px;margin-bottom:6px;border-bottom:1px solid var(--line)}
+.tabbar button{background:transparent;border:1px solid transparent;color:var(--muted);font-weight:600;padding:8px 14px}
+.tabbar button.on{background:var(--panel);border-color:var(--line);color:var(--text)}
+.tab{display:none}.tab.on{display:block}
+#verdict div,#health div{margin:6px 0;font-size:13px}#verdict .res{font-weight:600;margin-top:10px}
 main{max-width:1200px;margin:0 auto;padding:20px 16px 60px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
 .tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
@@ -104,6 +109,8 @@ section,.watch{min-width:0}
   <button id="logout">Log out</button>
 </header>
 <main>
+  <nav class="tabbar" id="tabbar"><button data-tab="overview">Overview</button><button data-tab="charts">Charts</button><button data-tab="earnings">Earnings</button><button data-tab="arbitrage">Arbitrage</button><button data-tab="setup">Setup &amp; data</button></nav>
+  <div class="tab" data-tab="overview">
   <div class="tiles">
     <div class="tile"><div class="k">Uptime</div><div class="v" id="t-uptime">–</div></div>
     <div class="tile"><div class="k">Pool updates</div><div class="v" id="t-updates">–</div></div>
@@ -116,6 +123,48 @@ section,.watch{min-width:0}
   </div>
 
   <section>
+    <h2>Test status</h2>
+    <div class="gauges">
+      <div class="gauge"><div class="k">72-hour earnings test</div><div id="g-test"></div></div>
+      <div class="gauge"><div class="k">Verdict (rules fixed in advance)</div><div id="verdict"></div></div>
+      <div class="gauge"><div class="k">Health</div><div id="health"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Earnings overview</h2>
+    <div class="gauges">
+      <div class="gauge"><div class="k">Best position right now (net vs holding)</div><div id="g-lp"></div></div>
+      <div class="gauge"><div class="k">Positions</div>
+        <div class="meter" id="m-ahead"></div><div class="meter" id="m-range"></div><div class="meter" id="m-hours"></div></div>
+      <div class="gauge"><div class="k">Best result per token (net vs holding)</div><div id="b-token" class="bars"></div></div>
+    </div>
+    <div id="lp-spread" class="note"></div>
+    <p class="note">All paper positions, no real money. The tracking meter fills toward 72 hours, the minimum before results mean much.</p>
+  </section>
+
+  <section>
+    <h2>Position health</h2>
+    <div class="gauges">
+      <div class="gauge"><div class="k">Best SOL per day right now</div><div id="g-sol"></div></div>
+      <div class="gauge"><div class="k">Worst position right now</div><div id="g-worst"></div></div>
+      <div class="gauge"><div class="k">How positions are doing</div>
+        <div class="meter" id="m-pay"></div><div class="meter" id="m-never"></div><div class="meter" id="m-fresh"></div></div>
+    </div>
+    <p class="note">"Pays for itself" counts positions whose pace would cover the cost of opening and closing within a week. "Never dipped" counts positions that have never been behind holding.</p>
+  </section>
+
+  <section>
+    <h2>Market mood <span class="note" id="mood-age"></span></h2>
+    <div class="gauges">
+      <div class="gauge"><div class="k">Crypto regime (0 = risk-off, 100 = risk-on)</div><div id="g-mood"></div></div>
+      <div class="gauge"><div class="k">What's driving it</div><div id="mood-comps"></div></div>
+      <div class="gauge"><div class="k">SOL</div><div id="mood-sol"></div></div>
+    </div>
+    <p class="note">Describes the market; it is not a buy or sell signal. Regime scoring comes from the crypto-regime-analyzer skill (tradermonty, MIT licence). Refreshes every 6 hours; you get a Telegram alert when the regime changes zone. Per-token LP weather and safety are on the Earnings tab.</p>
+  </section>
+
+  <section>
     <h2>Live overview <span class="note" id="live-age"></span></h2>
     <div class="gauges">
       <div class="gauge"><div class="k">Behind chain tip (median, slots)</div><div id="g-lag"></div></div>
@@ -126,7 +175,9 @@ section,.watch{min-width:0}
     <p class="note">Rates are measurements, not profits: "tradable" means a simulated round trip would have cleared your costs.
       "Closed within 1 slot" is how often someone else was faster than a home setup could possibly be.</p>
   </section>
+  </div>
 
+  <div class="tab" data-tab="charts">
   <div class="two">
     <section>
       <h2>Gap after fees per token (%)</h2>
@@ -139,33 +190,6 @@ section,.watch{min-width:0}
       <p class="note">How busy the watched pools are. Drops to zero mean the data stream stalled.</p>
     </section>
   </div>
-
-  <section>
-    <h2>Market mood <span class="note" id="mood-age"></span></h2>
-    <div class="gauges">
-      <div class="gauge"><div class="k">Crypto regime (0 = risk-off, 100 = risk-on)</div><div id="g-mood"></div></div>
-      <div class="gauge"><div class="k">What's driving it</div><div id="mood-comps"></div></div>
-      <div class="gauge"><div class="k">SOL</div><div id="mood-sol"></div></div>
-    </div>
-    <h3>LP weather: how often each token's price stayed inside the range (last 90 days)</h3>
-    <div class="scroll"><table><thead><tr><th>Token</th><th>Against</th><th>3 days ±5%</th><th>3 days ±20%</th>
-      <th>7 days ±5%</th><th>7 days ±20%</th><th>Typical 7-day move</th><th>±5% weather</th><th>±20% weather</th></tr></thead><tbody id="mood-weather"></tbody></table></div>
-    <div id="mood-weather-empty" class="empty">The first reading arrives about 5–7 minutes after Orbit starts (CoinGecko's free tier is slow on purpose).</div>
-    <p class="note">Describes the market; it is not a buy or sell signal. Regime scoring comes from the crypto-regime-analyzer skill (tradermonty, MIT licence).
-      Weather is judged separately for each range over 3-day stretches: "calm" = the price stayed inside 80%+ of the time, so the position mostly keeps earning fees; "choppy" = 50–80%; "stormy" = under 50%, where it is often pushed out of range and price moves tend to beat the fees.
-      Daily closes hide intraday swings, so real figures are a little worse. Refreshes every 6 hours; you get a Telegram alert when the regime changes zone.</p>
-  </section>
-
-  <section>
-    <h2>Earnings overview</h2>
-    <div class="gauges">
-      <div class="gauge"><div class="k">Best position right now (net vs holding)</div><div id="g-lp"></div></div>
-      <div class="gauge"><div class="k">Positions</div>
-        <div class="meter" id="m-ahead"></div><div class="meter" id="m-range"></div><div class="meter" id="m-hours"></div></div>
-      <div class="gauge"><div class="k">Best result per token (net vs holding)</div><div id="b-token" class="bars"></div></div>
-    </div>
-    <p class="note">All paper positions, no real money. The tracking meter fills toward 72 hours, the minimum before results mean much.</p>
-  </section>
 
   <div class="two">
     <section>
@@ -180,17 +204,6 @@ section,.watch{min-width:0}
     </section>
   </div>
 
-  <section>
-    <h2>Position health</h2>
-    <div class="gauges">
-      <div class="gauge"><div class="k">Best SOL per day right now</div><div id="g-sol"></div></div>
-      <div class="gauge"><div class="k">Worst position right now</div><div id="g-worst"></div></div>
-      <div class="gauge"><div class="k">How positions are doing</div>
-        <div class="meter" id="m-pay"></div><div class="meter" id="m-never"></div><div class="meter" id="m-fresh"></div></div>
-    </div>
-    <p class="note">"Pays for itself" counts positions whose pace would cover the cost of opening and closing within a week. "Never dipped" counts positions that have never been behind holding.</p>
-  </section>
-
   <div class="two">
     <section>
       <h2>Net vs holding over time: top 6 positions (%)</h2>
@@ -203,13 +216,58 @@ section,.watch{min-width:0}
       <p class="note">Green: fees collected so far. Red: loss from price moves so far. Same units, so you can compare them directly. A pool is only interesting if green keeps beating red over days.</p>
     </section>
   </div>
+  </div>
 
+  <div class="tab" data-tab="earnings">
+  <section>
+    <h2>Pool earnings (paper liquidity positions) <button id="lp-reset" class="danger">Reset tracking</button></h2>
+    <div class="row controls">
+      <label>Token <select id="lp-token"><option value="">All tokens</option></select></label>
+      <label>Range <select id="lp-range"><option value="">Both</option><option value="5">±5%</option><option value="5r">±5% auto</option><option value="20">±20%</option></select></label>
+      <label class="chk"><input type="checkbox" id="lp-hide" checked> Hide rows with no activity</label>
+      <label class="chk"><input type="checkbox" id="lp-group"> Group by token</label>
+      <span class="spacer"></span><span class="note" id="lp-count"></span>
+    </div>
+    <div class="scroll"><table class="sortable"><thead><tr id="lp-head">
+      <th data-k="watch">Token</th><th data-k="pool">Pool</th><th data-k="range_pct">Range</th><th data-k="hours">Tracked</th>
+      <th data-k="in_range_pct">In range</th><th data-k="fees_pct">Fees earned</th><th data-k="fees_per_day_pct">Fees per day</th>
+      <th data-k="price_move_pct">Price-move loss</th><th data-k="net_vs_hold_pct">Net vs holding</th>
+      <th data-k="worst_net_pct">Worst so far</th><th data-k="net_sol_per_day">On your SOL / day</th>
+      <th data-k="days_to_break_even">Days to break even</th></tr></thead>
+      <tbody id="lp"></tbody></table></div>
+    <div id="lp-empty" class="empty">Waiting for Orca or Raydium CLMM pool updates.</div>
+    <p class="note">"On your SOL / day" applies today's pace to your own capital; "Days to break even" compares that with the cost of opening and closing the position (network fees plus the swaps in and out).
+      "Worst so far" is the lowest this position has been, so a bad stretch can't hide behind an average.
+      A pretend 100 SOL/USDC position in each Orca and Raydium CLMM pool, over a price range of ±5% or ±20% set when tracking started. Fees come from each pool's own on-chain fee counter.
+      "Price-move loss" compares the position with simply holding the coins. "Net vs holding" = fees + that loss; green means providing liquidity beat holding. No real money is involved. Judge it after several days, not hours.</p>
+  </section>
+
+  <section>
+    <h2>LP weather &amp; token safety</h2>
+    <p class="note">How often each token's price stayed inside each range over the last 90 days, and what the chain says about the token.</p>
+    <div class="scroll"><table><thead><tr><th>Token</th><th>Against</th><th>3 days ±5%</th><th>3 days ±20%</th>
+      <th>7 days ±5%</th><th>7 days ±20%</th><th>Typical 7-day move</th><th>±5% weather</th><th>±20% weather</th><th>Token safety</th></tr></thead><tbody id="mood-weather"></tbody></table></div>
+    <div id="mood-weather-empty" class="empty">The first reading arrives about 5–7 minutes after Orbit starts (CoinGecko's free tier is slow on purpose).</div>
+    <p class="note">Weather is judged separately for each range over 3-day stretches: "calm" = the price stayed inside 80%+ of the time, so the position mostly keeps earning fees; "choppy" = 50–80%; "stormy" = under 50%, where it is often pushed out of range and price moves tend to beat the fees.
+      Daily closes hide intraday swings, so real figures are a little worse.
+      Token safety is read from the chain: "risky" = someone can still create more tokens or freeze holders' tokens (a liquidity position could be diluted or locked); "caution" = risky token features or the top 10 holders own over half; hover for details. "Top 10 hold" leaves out the pools Orbit watches but still counts exchanges.</p>
+  </section>
+  </div>
+
+  <div class="tab" data-tab="arbitrage">
   <section>
     <h2>Arbitrage by token</h2>
     <div class="scroll"><table><thead><tr><th>Token</th><th>Gaps seen</th><th>Tradable</th><th>Closed within 1 slot</th><th>Median time open</th><th>Best 2.5 SOL round trip</th></tr></thead>
       <tbody id="arb"></tbody></table></div>
     <div id="arb-empty" class="empty">No gaps yet.</div>
     <p class="note">"Closed within 1 slot" means a faster bot took it before a home setup could act.</p>
+  </section>
+
+  <section>
+    <h2>Open gaps right now</h2>
+    <div class="scroll"><table><thead><tr><th>Watch</th><th>Buy → sell</th><th>Open for</th><th>After fees</th><th>Depth check</th></tr></thead>
+      <tbody id="opengaps"></tbody></table></div>
+    <div id="opengaps-empty" class="empty">No gaps open. Prices across pools agree within fees.</div>
   </section>
 
   <section>
@@ -247,40 +305,34 @@ section,.watch{min-width:0}
     </section>
   </div>
 
-  <section>
-    <h2>Pool earnings (paper liquidity positions) <button id="lp-reset" class="danger">Reset tracking</button></h2>
-    <div class="row controls">
-      <label>Token <select id="lp-token"><option value="">All tokens</option></select></label>
-      <label>Range <select id="lp-range"><option value="">Both</option><option value="5">±5%</option><option value="20">±20%</option></select></label>
-      <label class="chk"><input type="checkbox" id="lp-hide" checked> Hide rows with no activity</label>
-      <label class="chk"><input type="checkbox" id="lp-group"> Group by token</label>
-      <span class="spacer"></span><span class="note" id="lp-count"></span>
-    </div>
-    <div class="scroll"><table class="sortable"><thead><tr id="lp-head">
-      <th data-k="watch">Token</th><th data-k="pool">Pool</th><th data-k="range_pct">Range</th><th data-k="hours">Tracked</th>
-      <th data-k="in_range_pct">In range</th><th data-k="fees_pct">Fees earned</th><th data-k="fees_per_day_pct">Fees per day</th>
-      <th data-k="price_move_pct">Price-move loss</th><th data-k="net_vs_hold_pct">Net vs holding</th>
-      <th data-k="worst_net_pct">Worst so far</th><th data-k="net_sol_per_day">On your SOL / day</th>
-      <th data-k="days_to_break_even">Days to break even</th></tr></thead>
-      <tbody id="lp"></tbody></table></div>
-    <div id="lp-empty" class="empty">Waiting for Orca or Raydium CLMM pool updates.</div>
-    <p class="note">"On your SOL / day" applies today's pace to your own capital; "Days to break even" compares that with the cost of opening and closing the position (network fees plus the swaps in and out).
-      "Worst so far" is the lowest this position has been, so a bad stretch can't hide behind an average.
-      A pretend 100 SOL/USDC position in each Orca and Raydium CLMM pool, over a price range of ±5% or ±20% set when tracking started. Fees come from each pool's own on-chain fee counter.
-      "Price-move loss" compares the position with simply holding the coins. "Net vs holding" = fees + that loss; green means providing liquidity beat holding. No real money is involved. Judge it after several days, not hours.</p>
-  </section>
+  <div class="two">
+    <section>
+      <h2>Recent profitable gaps</h2>
+      <div class="scroll"><table><thead><tr><th>Opened (UTC)</th><th>Watch</th><th>Buy → sell</th><th>Slots</th><th>Seconds</th><th>Peak gap</th><th>After fees</th><th>Depth check</th></tr></thead><tbody id="gaps"></tbody></table></div>
+      <div id="gaps-empty" class="empty">None yet.</div>
+    </section>
+    <section>
+      <h2>Recent shocks</h2>
+      <div class="scroll"><table><thead><tr><th>Time (UTC)</th><th>Watch</th><th>Pool</th><th>Move</th><th>Gap visible?</th></tr></thead><tbody id="shocks"></tbody></table></div>
+      <div id="shocks-empty" class="empty">None yet.</div>
+    </section>
+  </div>
+  </div>
 
-  <section>
-    <h2>Open gaps right now</h2>
-    <div class="scroll"><table><thead><tr><th>Watch</th><th>Buy → sell</th><th>Open for</th><th>After fees</th><th>Depth check</th></tr></thead>
-      <tbody id="opengaps"></tbody></table></div>
-    <div id="opengaps-empty" class="empty">No gaps open. Prices across pools agree within fees.</div>
-  </section>
-
+  <div class="tab" data-tab="setup">
   <section>
     <h2>Watches <button id="w-expand">Expand all</button> <button id="w-collapse">Collapse all</button></h2>
     <div id="watches"></div>
     <p class="note">Costs, minimum profit and fees are your assumptions. Saving restarts the watcher; gaps open at that moment are dropped, not mistimed.</p>
+  </section>
+
+  <section>
+    <h2>Add a token</h2>
+    <div class="row">
+      <input type="text" id="mint" placeholder="Token mint address" size="48" spellcheck="false">
+      <button id="discover" class="primary">Find pools</button>
+    </div>
+    <div id="disc"></div>
   </section>
 
   <div class="two">
@@ -299,33 +351,6 @@ section,.watch{min-width:0}
         Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway to turn them on.</p>
     </section>
   </div>
-
-  <section>
-    <h2>Add a token</h2>
-    <div class="row">
-      <input type="text" id="mint" placeholder="Token mint address" size="48" spellcheck="false">
-      <button id="discover" class="primary">Find pools</button>
-    </div>
-    <div id="disc"></div>
-  </section>
-
-  <div class="two">
-    <section>
-      <h2>Recent profitable gaps</h2>
-      <div class="scroll"><table><thead><tr><th>Opened (UTC)</th><th>Watch</th><th>Buy → sell</th><th>Slots</th><th>Seconds</th><th>Peak gap</th><th>After fees</th><th>Depth check</th></tr></thead><tbody id="gaps"></tbody></table></div>
-      <div id="gaps-empty" class="empty">None yet.</div>
-    </section>
-    <section>
-      <h2>Recent shocks</h2>
-      <div class="scroll"><table><thead><tr><th>Time (UTC)</th><th>Watch</th><th>Pool</th><th>Move</th><th>Gap visible?</th></tr></thead><tbody id="shocks"></tbody></table></div>
-      <div id="shocks-empty" class="empty">None yet.</div>
-    </section>
-  </div>
-
-  <section>
-    <h2>Report <button id="refresh-report">Refresh</button></h2>
-    <pre id="report">Loading…</pre>
-  </section>
 
   <section>
     <h2>Saved reports &amp; data <a class="btn primary" href="/download/bundle.zip">Download analysis bundle</a> <button id="arc-save">Save a copy now</button></h2>
@@ -347,9 +372,15 @@ section,.watch{min-width:0}
   </section>
 
   <section>
+    <h2>Report <button id="refresh-report">Refresh</button></h2>
+    <pre id="report">Loading…</pre>
+  </section>
+
+  <section>
     <h2>Activity</h2>
     <div id="log" class="log"></div>
   </section>
+  </div>
 </main>
 
 <script nonce="{{NONCE}}">
@@ -387,13 +418,13 @@ const saveOpen = () => { try { localStorage.setItem("orbit-open", JSON.stringify
 let lpByWatch = {};
 function leaderText(label) {
   const r = lpByWatch[label];
-  return r ? `${r.pool.replace(/^(Orca Whirlpool|Raydium CLMM) /, "")} ±${r.range_pct}% ${r.net_vs_hold_pct >= 0 ? "+" : ""}${fmt(r.net_vs_hold_pct, 3)}%` : "not measured";
+  return r ? `${r.pool.replace(/^(Orca Whirlpool|Raydium CLMM) /, "")} ±${r.range_pct}%${r.strategy === "rebalance" ? " auto" : ""} ${r.net_vs_hold_pct >= 0 ? "+" : ""}${fmt(r.net_vs_hold_pct, 3)}%` : "not measured";
 }
 function netText(w) { return w.net_gap_pct === null || w.net_gap_pct === undefined ? "–" : fmt(w.net_gap_pct, 3) + "%"; }
 
 function renderWatches(ws) {
   const sig = JSON.stringify(ws.map(w => [w.label, w.cost_sol, w.min_profit_sol, w.min_net_gap_pct, w.shock_pct,
-    w.pools.map(p => [p.name, p.fee_editable ? p.fee : null, p.suspect])]));
+    w.pools.map(p => [p.name, p.fee_editable ? p.fee : null, p.suspect, (p.idle_min || 0) >= 30])]));
   const box = $("watches");
   if (sig === watchSig) {                       // only refresh live numbers, keep any typing intact
     ws.forEach((w, i) => {
@@ -418,7 +449,8 @@ function renderWatches(ws) {
     const feeInputs = {};
     const msg = el("div", {class: "msg"});
     const rows = w.pools.map(p => el("tr", {},
-      el("td", {text: p.name + (p.suspect ? " (excluded: price looked wrong)" : "")}),
+      el("td", {text: p.name + (p.suspect ? " (excluded: price looked wrong)" : "")
+        + ((p.idle_min || 0) >= 30 ? ` (idle ${p.idle_min >= 120 ? Math.round(p.idle_min / 60) + " h" : p.idle_min + " min"}: left out of live gaps)` : "")}),
       el("td", {text: KIND[p.kind] || p.kind}),
       el("td", {class: "price", text: p.price === null ? "–" : `${fmt(p.price, 10)} ${p.quote}`}),
       el("td", {class: "livefee"}, p.fee_editable
@@ -636,6 +668,52 @@ function bars(host, rows, emptyText) {
   }));
 }
 
+function renderStatus(s) {
+  const lp = (s.lp || []).filter(r => r.hours > 0), good = cssv("--good"), bad = cssv("--critical"), warn = cssv("--warning");
+  const hrs = lp.length ? Math.max(...lp.map(r => r.hours)) : 0;
+  gauge($("g-test"), Math.min(1, hrs / 72), `${fmt(hrs, 1)} h`, hrs >= 72 ? "complete: verdict below" : `of 72 hours · ${fmt(Math.max(0, 72 - hrs), 1)} h to go`, hrs >= 72 ? good : cssv("--s1"));
+  const v = s.verdict || [];
+  $("verdict").replaceChildren(...(v.length ? v.slice(1).map(line => {
+    const t = line.trim(), d = el("div", {class: t.startsWith("RESULT") ? "res" : "", text: t});
+    if (/PASS/.test(t)) d.style.color = good; else if (/FAIL/.test(t)) d.style.color = bad;
+    return d; }) : [el("div", {class: "muted", text: "Waiting for data."})]));
+  if (v.length && /Pending/.test(v[1] || "")) $("verdict").append(el("div", {class: "note",
+    text: "Pass needs all three: a strategy ahead of holding when spread over every position, already ahead at 24 h, and day-1 leaders that keep leading."}));
+  const h = s.history || []; let live = 0; for (let i = 1; i < h.length; i++) if (h[i].updates > h[i - 1].updates) live++;
+  const flow = h.length > 1 ? live / (h.length - 1) : 0, moodAge = s.mood ? (Date.now() / 1000 - s.mood.t) / 3600 : null;
+  const row = (ok, text) => { const d = el("div", {}, el("b", {text: ok === null ? "… " : ok ? "✓ " : "✗ "}), text);
+    d.firstChild.style.color = ok === null ? warn : ok ? good : bad; return d; };
+  $("health").replaceChildren(
+    row(s.state === "running", `Watcher ${s.state}, up ${dur(s.uptime_s)}`),
+    row(h.length > 1 ? flow >= 0.9 : null, `Data flowing ${fmt(flow * 100, 0)}% of the last hour`),
+    row(s.latency ? s.latency.median_slots <= 1 : null, `Behind chain tip: ${s.latency ? s.latency.median_slots + " slot(s)" : "–"}`),
+    row(moodAge === null ? null : moodAge < 7, `Market mood ${moodAge === null ? "not read yet" : "updated " + fmt(moodAge, 1) + " h ago"}`),
+    row(s.alerts_enabled, `Telegram alerts ${s.alerts_enabled ? "on (you'll hear about trouble)" : "off"}`));
+}
+
+let tab = "overview";
+try { tab = localStorage.getItem("orbit-tab") || "overview"; } catch (e) {}
+function showTab(t) {
+  if (!document.querySelector(`.tab[data-tab="${t}"]`)) t = "overview";
+  tab = t;
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x.dataset.tab === t));
+  document.querySelectorAll("#tabbar button").forEach(b => b.classList.toggle("on", b.dataset.tab === t));
+  try { localStorage.setItem("orbit-tab", t); } catch (e) {}
+}
+document.querySelectorAll("#tabbar button").forEach(b => b.addEventListener("click", () => { showTab(b.dataset.tab); refresh(); }));
+showTab(tab);
+
+function renderSpread(s) {
+  const sp = s.lp_spread || {}, parts = [];
+  const LBL = {"5": "±5%", "20": "±20%", "5 auto": "±5% auto-rebalancing"};
+  for (const rng of ["5", "20", "5 auto"]) { const v = sp[rng]; if (!v) continue;
+    const c = v.avg_net_pct >= 0 ? "pos" : "neg";
+    parts.push(el("span", {}, `All ${LBL[rng]} positions, spread evenly: `, el("b", {class: c, text: `${v.avg_net_pct >= 0 ? "+" : ""}${fmt(v.avg_net_pct, 3)}%`}),
+      ` vs holding (${v.ahead} of ${v.n} ahead, ${v.avg_sol_per_day >= 0 ? "+" : ""}${fmt(v.avg_sol_per_day, 5)} SOL/day). `)); }
+  $("lp-spread").replaceChildren(...(parts.length ? [el("b", {text: "Realistic result: "}), ...parts,
+    "You can't know the best position in advance, so this, not the top gauge, is what you'd have earned."] : []));
+}
+
 function renderMood(s) {
   const m = s.mood, st = s.mood_status || {}, good = cssv("--good"), bad = cssv("--critical"), warn = cssv("--warning");
   if (!m) {
@@ -658,16 +736,21 @@ function renderMood(s) {
     el("div", {class: "note", text: sol.signal || ""}));
   const rows = [];
   for (const t of m.tokens || []) {
-    for (const vs of ["sol", "usd"]) if (t["vs_" + vs]) rows.push({...t["vs_" + vs], watch: t.watch, vs: vs.toUpperCase()});
-    if (!t.vs_sol && !t.vs_usd) rows.push({watch: t.watch, vs: "–", note: t.note});
+    for (const vs of ["sol", "usd"]) if (t["vs_" + vs]) rows.push({...t["vs_" + vs], watch: t.watch, vs: vs.toUpperCase(), safety: t.safety});
+    if (!t.vs_sol && !t.vs_usd) rows.push({watch: t.watch, vs: "–", note: t.note, safety: t.safety});
   }
   const p = v => v === undefined ? "–" : el("span", {class: v >= 80 ? "pos" : v < 50 ? "neg" : "", text: fmt(v, 0) + "%"});
   const W = {calm: good, choppy: warn, stormy: bad};
   const wx = w => { const b = el("b", {text: w || "unknown"}); b.style.color = W[w] || ""; return b; };
+  const S = {ok: good, caution: warn, risky: bad};
+  const safe = x => { if (!x) return "–"; if (x.error) return "not checked";
+    const b = el("b", {text: x.level + (x.top10_pct !== null && x.top10_pct !== undefined ? ` · top 10 hold ${fmt(x.top10_pct, 0)}%` : ""),
+      title: x.flags.length ? x.flags.join("\n") : "No mint or freeze authority, no risky token features"});
+    b.style.color = S[x.level] || ""; return b; };
   renderTable("mood-weather", "mood-weather-empty", rows, r => r.note !== undefined && r.in_3d_5 === undefined
-    ? [r.watch, "–", r.note, "", "", "", "", "unknown", "unknown"]
+    ? [r.watch, "–", r.note, "", "", "", "", "unknown", "unknown", safe(r.safety)]
     : [r.watch, r.vs, p(r.in_3d_5), p(r.in_3d_20), p(r.in_7d_5), p(r.in_7d_20), `${fmt(r.median_move_7d, 1)}%`,
-       wx(r.weather_5), wx(r.weather_20)]);
+       wx(r.weather_5), wx(r.weather_20), safe(r.safety)]);
   const ago = Math.max(0, Date.now() / 1000 - m.t);
   $("mood-age").textContent = `updated ${ago < 3600 ? Math.round(ago / 60) + " min" : fmt(ago / 3600, 1) + " h"} ago · funding from ${m.funding_source}`
     + ` · dominance history ${Math.min(m.dominance_days, 31)}/31 days`;
@@ -681,7 +764,7 @@ function renderInsights(s) {
     const v = top.net_vs_hold_pct;
     const sol = top.net_sol_per_day || 0;
     gauge($("g-lp"), Math.max(0, Math.min(1, v / 1)), pct(v),
-      `${top.pool} ±${top.range_pct}% · ${top.watch} · ` + (top.early ? "per day: too early" : `${sol >= 0 ? "+" : ""}${fmt(sol, 5)} SOL/day on ${fmt(top.capital_sol, 2)} SOL`),
+      `${top.pool} ±${top.range_pct}%${top.strategy === "rebalance" ? " auto" : ""} · ${top.watch} · ` + (top.early ? "per day: too early" : `${sol >= 0 ? "+" : ""}${fmt(sol, 5)} SOL/day on ${fmt(top.capital_sol, 2)} SOL`),
       v >= 0 ? good : bad);
   } else gauge($("g-lp"), 0, "–", "waiting for data", cssv("--muted"));
   const ahead = live.filter(r => r.net_vs_hold_pct > 0).length, inr = live.filter(r => r.in_range_now).length;
@@ -693,7 +776,7 @@ function renderInsights(s) {
   for (const r of live) if (!best[r.watch] || r.net_vs_hold_pct > best[r.watch].net_vs_hold_pct) best[r.watch] = r;
   bars($("b-token"), Object.values(best).sort((a, b) => b.net_vs_hold_pct - a.net_vs_hold_pct)
     .map(r => ({label: r.watch, value: r.net_vs_hold_pct, color: r.net_vs_hold_pct >= 0 ? good : bad, text: pct(r.net_vs_hold_pct)})), "Waiting for data.");
-  const five = live.filter(r => r.range_pct === 5).sort((a, b) => b.fees_pct - a.fees_pct).slice(0, 8);
+  const five = live.filter(r => r.range_pct === 5 && r.strategy !== "rebalance").sort((a, b) => b.fees_pct - a.fees_pct).slice(0, 8);
   const fl = [];
   for (const r of five) {
     fl.push({label: `${r.watch} · ${r.pool}`, value: r.fees_pct, color: good, text: pct(r.fees_pct)});
@@ -750,7 +833,7 @@ function renderLp() {
     tokSel.value = tokens.includes(cur) ? cur : "";
   }
   const tok = tokSel.value, rng = $("lp-range").value, hide = $("lp-hide").checked, group = $("lp-group").checked;
-  let rows = lastLp.filter(r => (!tok || r.watch === tok) && (!rng || String(r.range_pct) === rng)
+  let rows = lastLp.filter(r => (!tok || r.watch === tok) && (!rng || String(r.range_pct) + (r.strategy === "rebalance" ? "r" : "") === rng)
     && (!hide || (r.hours > 0 && (r.fees_pct !== 0 || r.price_move_pct !== 0))));
   const {k, asc} = lpSort, dir = asc ? 1 : -1;
   const cmp = (a, b) => (typeof a[k] === "string" ? a[k].localeCompare(b[k]) : (a[k] ?? -Infinity) - (b[k] ?? -Infinity)) * dir;
@@ -760,7 +843,7 @@ function renderLp() {
   $("lp-count").textContent = `${rows.length} of ${lastLp.length} positions`
     + (skipped ? ` · ${skipped} odd pool readings ignored` : "");
   const pc = v => el("span", {class: v >= 0 ? "pos" : "neg", text: (v >= 0 ? "+" : "") + fmt(v, 3) + "%"});
-  const line = r => el("tr", {}, [r.watch || "", `${r.pool} (${r.quote})`, `±${r.range_pct}%`, `${fmt(r.hours, 1)} h`,
+  const line = r => el("tr", {}, [r.watch || "", `${r.pool} (${r.quote})`, r.strategy === "rebalance" ? el("span", {title: `Re-centred ${r.rebalances} times, costing ${fmt(r.rebalance_cost_pct, 3)}% so far`, text: `±${r.range_pct}% auto (${r.rebalances}×)`}) : `±${r.range_pct}%`, `${fmt(r.hours, 1)} h`,
     `${fmt(r.in_range_pct, 0)}%${r.in_range_now ? "" : " (out now)"}`, pc(r.fees_pct), r.early ? early() : pc(r.fees_per_day_pct),
     pc(r.price_move_pct), pc(r.net_vs_hold_pct), pc(r.worst_net_pct || 0),
     r.early ? early() : el("span", {class: (r.net_sol_per_day || 0) >= 0 ? "pos" : "neg", text: `${(r.net_sol_per_day || 0) >= 0 ? "+" : ""}${fmt(r.net_sol_per_day, 5)} SOL`}),
@@ -849,6 +932,8 @@ async function refresh() {
   renderLive(s);
   renderInsights(s);
   renderMood(s);
+  renderSpread(s);
+  renderStatus(s);
   renderAudit(s);
   lastLp = s.lp || [];
   renderLp();

@@ -466,6 +466,7 @@ class Pool:
         self.slots: dict[str, int] = {}
         self.last_price: float | None = None
         self.suspect = False
+        self.last_update = time.time()            # last time this pool's price changed (for spotting idle pools)
         self.L: int | None = None        # Whirlpool/CLMM active liquidity (raw)
         self.sq: float | None = None     # sqrt(raw price of A in B)
         self.bin_step: float | None = None  # DLMM bin width as a fraction
@@ -493,6 +494,7 @@ class Pool:
         """Keep the state as of `slot`, so a real swap can later be re-quoted from the state just before it."""
         snap = {"base": self.base, "quote": self.quote, "fee": self.fee, "L": self.L, "sq": self.sq,
                 "state_price": self.state_price}
+        self.last_update = time.time()
         if self.history and self.history[-1][0] == slot:
             self.history[-1] = (slot, snap)
         else:
@@ -597,10 +599,15 @@ class Watch:
 # Pool earnings: a paper liquidity position in each Whirlpool / CLMM pool
 # ---------------------------------------------------------------------------
 LP_RANGES = (0.05, 0.20)     # position ranges: price +/-5% and +/-20% around the start price
+LP_REBALANCE = (0.05,)       # also track these ranges as auto-rebalancing positions (Hummingbot-style)
+DAY1_S = 86400               # checkpoint used to test whether early leaders stay ahead
+VERDICT_HOURS = 72           # the test length the verdict rules below are judged on
+REBALANCE_AFTER_S = 600      # re-center a rebalancing position after 10 minutes out of range
 LP_START_VALUE = 100.0       # paper position size, in the pool's quote (SOL or USDC)
 MAX_FEE_STEP = 0.01          # sanity cap: one update can add at most 1% of the position in fees
 MAX_FEE_TOTAL = 10.0         # sanity cap: total fees above 1000% of the position mean something broke
 LP_CAPITAL_SOL = float(os.environ.get("ORBIT_LP_CAPITAL_SOL", 2.5))   # your money, for the SOL columns
+IDLE_POOL_S = 1800            # a pool whose price hasn't changed for 30 min is "idle" on the dashboard
 LP_MIN_HOURS = 1.0            # below this, per-day and break-even figures are 'too early'
 MAX_BREAK_EVEN_DAYS = 365     # slower than this counts as 'never at this pace'
 TX_VERSION = 1               # newest transaction version the auditor asks the node for
@@ -616,8 +623,10 @@ class LpSim:
     Price-move loss compares the position with simply holding the coins it started with.
     """
 
-    def __init__(self, pool: "Pool", width: float, t: float, state: dict | None = None):
+    def __init__(self, pool: "Pool", width: float, t: float, state: dict | None = None, rebalance: bool = False):
         self.pool, self.width = pool, width
+        self.rebalance, self.rebalances, self.rebalance_cost, self.out_since = rebalance, 0, 0.0, None
+        self.day1 = None                          # "net vs holding" when the position turned 24 h old
         if state:
             self.__dict__.update({k: v for k, v in state.items() if k not in ("pool", "width")})
             self.fg = tuple(self.fg)
@@ -629,9 +638,7 @@ class LpSim:
                 raise ValueError("restored position is not sane")
             return
         s0 = pool.sq
-        self.sa, self.sb = s0 * math.sqrt(1 - width), s0 * math.sqrt(1 + width)
-        self.liq = 1.0
-        self.liq = LP_START_VALUE / self._value(s0)  # raw liquidity for a START-sized position
+        self._center(s0, LP_START_VALUE)       # raw liquidity for a START-sized position
         self.hold_tok, self.hold_quote = self._amounts(s0)
         self.fee_tok = self.fee_quote = 0.0
         self.fg, self.s_last = pool.fg, s0
@@ -641,6 +648,31 @@ class LpSim:
         self.slot = 0
         self.worst = 0.0        # lowest "net vs holding" this position has been through
         self.best = 0.0
+
+    def _center(self, s0: float, value: float) -> None:
+        """Put `value` (in quote) into a fresh range around sqrt price s0."""
+        self.sa, self.sb = s0 * math.sqrt(1 - self.width), s0 * math.sqrt(1 + self.width)
+        self.liq = 1.0
+        self.liq = value / self._value(s0)
+
+    def _maybe_rebalance(self, t: float) -> None:
+        """Hummingbot-style: once the price has stayed outside the range for REBALANCE_AFTER_S, close and reopen
+        around the current price. Each move pays the pool fee on the half that gets swapped plus network fees."""
+        s = self.pool.sq
+        if self.sa <= s <= self.sb:
+            self.out_since = None
+            return
+        if self.out_since is None:
+            self.out_since = t
+            return
+        if t - self.out_since < REBALANCE_AFTER_S:
+            return
+        value = self._value(s)
+        frac = 0.5 * self.pool.base_fee + LP_TX_COST_SOL / LP_CAPITAL_SOL
+        self.rebalance_cost += value * frac
+        self._center(s, value * (1 - frac))
+        self.rebalances += 1
+        self.out_since = None
 
     def _amounts(self, s: float) -> tuple[float, float]:
         """(token, quote) in human units held by the position at sqrt price s."""
@@ -670,6 +702,16 @@ class LpSim:
             else:
                 self.skipped += 1
         self.fg, self.s_last, self.t_last, self.slot = p.fg, p.sq, t, slot or getattr(self, "slot", 0)
+        if self.rebalance:
+            self._maybe_rebalance(t)
+        if self.day1 is None and t - self.t0 >= DAY1_S:
+            self.day1 = self._net_pct()
+
+    def _net_pct(self) -> float:
+        price = self.pool.price()
+        hold = self.hold_tok * price + self.hold_quote
+        fees = self.fee_tok * price + self.fee_quote
+        return 100 * (self._value(self.pool.sq) + fees - hold) / LP_START_VALUE
 
     def sane(self) -> bool:
         """False if this position's numbers stopped making sense (bad restore, garbled counter)."""
@@ -713,6 +755,10 @@ class LpSim:
                 "capital_sol": LP_CAPITAL_SOL, "cost_sol": round(cost, 5),
                 "net_sol_per_day": round(sol_day, 5), "days_to_break_even": days,
                 "skipped_updates": self.skipped, "early": early,
+                "strategy": "rebalance" if self.rebalance else "static", "rebalances": self.rebalances,
+                "vs_quote_pct": round(pct(lp_now + fees - LP_START_VALUE), 4),
+                "day1_net_pct": None if self.day1 is None else round(self.day1, 4),
+                "rebalance_cost_pct": round(pct(self.rebalance_cost), 4),
                 "in_range_now": self.sa <= self.pool.sq <= self.sb}
 
     def state(self) -> dict:
@@ -742,21 +788,21 @@ class LpBook:
     def observe(self, pool: "Pool", t: float, slot: int = 0) -> None:
         if pool.kind not in FEE_GROWTH_OFFSETS or not (pool.fg and pool.sq and pool.ready()):
             return
-        for width in LP_RANGES:
-            key = f"{pool.address}|{width}"
+        for width, rb in [(w, False) for w in LP_RANGES] + [(w, True) for w in LP_REBALANCE]:
+            key = f"{pool.address}|{width}" + ("|rb" if rb else "")
             sim = self.sims.get(key)
             if sim is None:
                 prev = self.saved.get(key)
                 try:
-                    sim = LpSim(pool, width, t, prev["sim"] if prev else None)
+                    sim = LpSim(pool, width, t, prev["sim"] if prev else None, rebalance=rb)
                 except (KeyError, TypeError, ValueError, ZeroDivisionError):
-                    sim = LpSim(pool, width, t)   # unusable history: start this position again
+                    sim = LpSim(pool, width, t, rebalance=rb)   # unusable history: start this position again
                     self.restarted += 1
                 self.sims[key] = sim
             sim.pool = pool
             sim.observe(t, slot)
             if not sim.sane():                    # numbers went impossible: start this position again
-                self.sims[key] = LpSim(pool, width, t)
+                self.sims[key] = LpSim(pool, width, t, rebalance=rb)
                 self.restarted += 1
         if self.path and time.monotonic() - self._last_save > 30:
             self.save()
@@ -1157,9 +1203,15 @@ class Engine:
     def open_count(self) -> int:
         return sum(len(w.open) for w in self.watches)
 
-    def best_net_gap_pct(self, w: Watch) -> float | None:
+    @staticmethod
+    def pool_live(p: "Pool", active_only: bool) -> bool:
+        """Usable for a live gap reading. Idle pools (no price change for IDLE_POOL_S) keep a stale price that
+        shows a gap nobody can trade; the dashboard leaves them out, detection does not."""
+        return not p.suspect and (not active_only or time.time() - p.last_update < IDLE_POOL_S)
+
+    def best_net_gap_pct(self, w: Watch, active_only: bool = False) -> float | None:
         """Largest price gap between any two pools right now, after both fees (and the SOL/USDC fee)."""
-        pools = [(p, px) for p in w.pools if not p.suspect and (px := self.to_sol(w, p))]
+        pools = [(p, px) for p in w.pools if self.pool_live(p, active_only) and (px := self.to_sol(w, p))]
         best = None
         for i in range(len(pools)):
             for j in range(i + 1, len(pools)):
@@ -1169,8 +1221,8 @@ class Engine:
                 best = net if best is None else max(best, net)
         return None if best is None else best * 100
 
-    def max_gap_pct(self, w: Watch) -> float | None:
-        prices = [s for p in w.pools if not p.suspect and (s := self.to_sol(w, p))]
+    def max_gap_pct(self, w: Watch, active_only: bool = False) -> float | None:
+        prices = [s for p in w.pools if self.pool_live(p, active_only) and (s := self.to_sol(w, p))]
         if len(prices) < 2:
             return None
         return (max(prices) / min(prices) - 1) * 100
@@ -1687,7 +1739,7 @@ def snapshot(engine: Engine, rpc) -> None:
 def print_status(engine: Engine, started: float) -> None:
     mins = (time.time() - started) / 60
     gaps = "  ".join(f"{w.label} gap {g:.3f}%" for w in engine.watches
-                     if (g := engine.max_gap_pct(w)) is not None)
+                     if (g := engine.max_gap_pct(w, active_only=True)) is not None)
     s = engine.stats
     lat = engine.latency_stats()
     lag = f"behind tip {lat['median_slots']} slots (p90 {lat['p90_slots']}) | " if lat else ""
@@ -1817,6 +1869,49 @@ def dexscreener_pairs(mint: str, fetch=fetch_json) -> list[dict]:
 
 
 MIN_LIQUIDITY_USD = 10_000  # smaller pools are usually abandoned: their "gaps" never close
+
+
+TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+RISKY_EXTENSIONS = {"permanentDelegate": "issuer can move anyone's tokens",
+                    "transferHook": "custom code runs on every transfer",
+                    "transferFeeConfig": "a fee is taken on every transfer",
+                    "nonTransferable": "tokens cannot be transferred",
+                    "defaultAccountState": "new accounts can start frozen"}
+
+
+def token_safety(rpc, mint: str, known_vaults: set[str] | None = None) -> dict:
+    """Read-only on-chain checks on a token mint: can more be minted, can holders be frozen, risky Token-2022
+    features, and how concentrated the largest holders are (leaving out the pools Orbit watches)."""
+    info = rpc.call("getAccountInfo", [mint, {"encoding": "jsonParsed"}])
+    val = (info or {}).get("value") or {}
+    parsed = ((val.get("data") or {}).get("parsed") or {}).get("info") or {}
+    if not parsed:
+        return {"mint": mint, "error": "not a readable token mint"}
+    supply = int(parsed.get("supply") or 0)
+    flags = []
+    if parsed.get("mintAuthority"):
+        flags.append("mint authority active: more tokens can be created")
+    if parsed.get("freezeAuthority"):
+        flags.append("freeze authority active: holders' tokens can be frozen")
+    for ext in parsed.get("extensions") or []:
+        name = ext.get("extension")
+        if name in RISKY_EXTENSIONS:
+            flags.append(f"{name}: {RISKY_EXTENSIONS[name]}")
+    top_pct = None
+    try:
+        largest = (rpc.call("getTokenLargestAccounts", [mint]) or {}).get("value") or []
+        others = [a for a in largest if a.get("address") not in (known_vaults or set())]
+        if supply:
+            top_pct = round(100 * sum(int(a.get("amount") or 0) for a in others[:10]) / supply, 1)
+    except Exception:                                  # some RPCs refuse this call for very large tokens
+        pass
+    if top_pct is not None and top_pct > 50:
+        flags.append(f"top 10 holders own {top_pct}% (excluding watched pools)")
+    level = "risky" if any(f.startswith(("freeze", "mint", "permanentDelegate", "nonTransferable"))
+                           for f in flags) else "caution" if flags else "ok"
+    return {"mint": mint, "program": "Token-2022" if val.get("owner") == TOKEN_2022 else "Token",
+            "mint_authority": bool(parsed.get("mintAuthority")), "freeze_authority": bool(parsed.get("freezeAuthority")),
+            "top10_pct": top_pct, "flags": flags, "level": level}
 
 
 def mint_decimals(rpc, mints: list[str]) -> dict[str, int]:
@@ -2046,6 +2141,15 @@ def mood_report(folder: Path) -> list[str]:
                            f"{w.get('weather_5', '?')} | {w.get('weather_20', t.get('weather', '?'))}")
         if not (t.get("vs_sol") or t.get("vs_usd")):
             out.append(f"  {t['watch']} | - | {t.get('note') or 'no data'}")
+    safety = m.get("safety") or []
+    if safety:
+        out.append("  TOKEN SAFETY (read from the chain; 'risky' = more tokens can be created or holders can be frozen):")
+        for x in safety:
+            if x.get("error"):
+                out.append(f"  {x.get('watch')}: not checked ({x['error']})")
+            else:
+                top = f", top 10 hold {x['top10_pct']:.0f}%" if x.get("top10_pct") is not None else ""
+                out.append(f"  {x.get('watch')}: {x['level']}{top}" + (f" - {'; '.join(x['flags'])}" if x["flags"] else ""))
     out.append("  Weather is judged per range on 3-day windows: 'calm' = price stayed inside 80%+ of the time (the "
                "position mostly keeps earning fees), 'choppy' = 50-80%, 'stormy' = under 50% (it is often pushed out "
                "of range and price moves tend to beat the fees). Daily closes hide intraday swings, so real figures "
@@ -2188,19 +2292,92 @@ def audit_report(folder: Path) -> list[str]:
     return out
 
 
+def lp_spread(results: list[dict]) -> dict:
+    """What you'd have if you had split your money evenly over every position of each range (1 h+ of data)."""
+    out = {}
+    for key, rng, strat in (("5", 5, "static"), ("20", 20, "static"), ("5 auto", 5, "rebalance")):
+        rr = [r for r in results if r.get("range_pct") == rng and r.get("strategy", "static") == strat
+              and r.get("hours", 0) >= LP_MIN_HOURS]
+        if rr:
+            out[key] = {"n": len(rr), "ahead": sum(r["net_vs_hold_pct"] > 0 for r in rr),
+                        "avg_net_pct": round(statistics.mean(r["net_vs_hold_pct"] for r in rr), 3),
+                        "avg_sol_per_day": round(statistics.mean(r.get("net_sol_per_day", 0) for r in rr), 5),
+                        "avg_vs_quote_pct": round(statistics.mean(r.get("vs_quote_pct", 0) for r in rr), 3)}
+    return out
+
+
+def lp_verdict(results: list[dict]) -> list[str]:
+    """Pass/fail rules written down BEFORE the results were known (23-24 Sep 2026), judged automatically:
+      1. At least one strategy (+/-5%, +/-20%, +/-5% auto), spread evenly over all its positions, is ahead of
+         holding after its costs over the full test.
+      2. That same strategy was already ahead at the 24 h checkpoint (not one lucky late swing).
+      3. Winners can be picked: the day-1 top quarter did better than the day-1 bottom quarter afterwards.
+    All three must hold before real money is worth a small, capped trial."""
+    done = [r for r in results if r.get("hours", 0) >= VERDICT_HOURS]
+    out = ["", f"VERDICT (rules fixed in advance; judged on positions with {VERDICT_HOURS} h+ of data)"]
+    if not done:
+        have = max((r.get("hours", 0) for r in results), default=0)
+        return out + [f"  Pending: the oldest position has {have:.1f} of {VERDICT_HOURS} hours."]
+    passed = []
+    for key, rng, strat in (("+/-5%", 5, "static"), ("+/-20%", 20, "static"), ("+/-5% auto", 5, "rebalance")):
+        rr = [r for r in done if r.get("range_pct") == rng and r.get("strategy", "static") == strat]
+        if not rr:
+            continue
+        avg = statistics.mean(r["net_vs_hold_pct"] for r in rr)
+        d1 = [r["day1_net_pct"] for r in rr if r.get("day1_net_pct") is not None]
+        avg1 = statistics.mean(d1) if d1 else None
+        ok = avg > 0 and avg1 is not None and avg1 > 0
+        out.append(f"  {key}: average {avg:+.3f}% vs holding at the end, "
+                   + (f"{avg1:+.3f}% at 24 h" if avg1 is not None else "no 24 h checkpoint")
+                   + f" ({len(rr)} positions) -> rules 1-2 {'PASS' if ok else 'FAIL'}")
+        if ok:
+            passed.append(key)
+    ranked = sorted((r for r in done if r.get("day1_net_pct") is not None), key=lambda r: r["day1_net_pct"])
+    persist = None
+    if len(ranked) >= 8:
+        q = len(ranked) // 4
+        later = lambda g: statistics.mean(r["net_vs_hold_pct"] - r["day1_net_pct"] for r in g)
+        top, bottom = later(ranked[-q:]), later(ranked[:q])
+        persist = top > bottom
+        out.append(f"  Rule 3: after day 1, the day-1 top quarter moved {top:+.3f}% and the bottom quarter {bottom:+.3f}% "
+                   f"-> {'PASS: leaders kept leading' if persist else 'FAIL: day-1 leaders did not stay ahead'}")
+    else:
+        out.append("  Rule 3: not enough positions with a 24 h checkpoint to judge.")
+    verdict = bool(passed) and persist is True
+    out.append("  RESULT: " + (f"PASS for {', '.join(passed)} - a small, capped real trial could be justified."
+                              if verdict else "FAIL - providing liquidity did not reliably beat holding. "
+                              "Not worth real money on this evidence."))
+    return out
+
+
+def lp_spread_lines(rows: list) -> list[str]:
+    sp = lp_spread([r for _, r in rows])
+    if not sp:
+        return []
+    out = ["  SPREAD EVENLY (the realistic result: you can't know the winner in advance):"]
+    for rng, v in sp.items():
+        label = {"5": "+/-5%", "20": "+/-20%", "5 auto": "+/-5% auto-rebalancing"}.get(rng, rng)
+        out.append(f"    all {label} positions: average {v['avg_net_pct']:+.3f}% vs holding, {v['ahead']} of {v['n']} "
+                   f"ahead, {v['avg_sol_per_day']:+.5f} SOL/day on your capital; "
+                   f"{v['avg_vs_quote_pct']:+.3f}% vs just keeping the SOL/USDC you started with")
+    return out
+
+
 def lp_report_rows(rows: list) -> list[str]:
     out = []
     for name, r in sorted(rows, key=lambda x: -x[1]["net_vs_hold_pct"]):
         days = r.get("days_to_break_even")
+        rng = f"+/-{r['range_pct']}%" + (" auto" if r.get("strategy") == "rebalance" else "")
         if r.get("early", r["hours"] < LP_MIN_HOURS):
-            out.append(f"  +/-{r['range_pct']}% | {name} | {r['hours']:.1f} h | {r['in_range_pct']:.0f}% | "
+            out.append(f"  {rng} | {name} | {r['hours']:.1f} h | {r['in_range_pct']:.0f}% | "
                        f"{r['fees_pct']:+.3f}% | too early | {r['price_move_pct']:+.3f}% | "
                        f"{r['net_vs_hold_pct']:+.3f}% | {r.get('worst_net_pct', 0):+.3f}% | too early | too early")
             continue
-        out.append(f"  +/-{r['range_pct']}% | {name} | {r['hours']:.1f} h | {r['in_range_pct']:.0f}% | "
+        out.append(f"  {rng} | {name} | {r['hours']:.1f} h | {r['in_range_pct']:.0f}% | "
                    f"{r['fees_pct']:+.3f}% | {r['fees_per_day_pct']:+.3f}% | {r['price_move_pct']:+.3f}% | "
                    f"{r['net_vs_hold_pct']:+.3f}% | {r.get('worst_net_pct', 0):+.3f}% | "
-                   f"{r.get('net_sol_per_day', 0):+.5f} SOL | " + (f"{days:.2f}" if days else "never at this pace"))
+                   f"{r.get('net_sol_per_day', 0):+.5f} SOL | " + (f"{days:.2f}" if days else "never at this pace")
+                   + (f" | re-centred {r['rebalances']}x, cost {r['rebalance_cost_pct']:.3f}%" if r.get("strategy") == "rebalance" else ""))
     return out
 
 
@@ -2218,6 +2395,8 @@ def lp_report(folder: Path) -> list[str]:
            "  range | pool | hours | in range | fees | fees/day | price-move loss | net vs holding | "
            f"worst so far | on {cap:g} SOL/day | days to break even"]
     out += lp_report_rows(rows)
+    out += lp_spread_lines(rows)
+    out += lp_verdict([r for _, r in rows])
     out.append(f"  Per-day figures and break-even stay 'too early' until a position has {LP_MIN_HOURS:g} h of data; "
                f"a pace that needs more than {MAX_BREAK_EVEN_DAYS} days to pay back is shown as 'never at this pace'.")
     out.append("  'Net vs holding' = fees + price-move loss. Positive means providing liquidity beat just holding "

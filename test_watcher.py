@@ -872,7 +872,7 @@ class PoolEarningsTests(unittest.TestCase):
             path.write_text(json.dumps(bad), encoding="utf-8")
             book2 = W.LpBook(path)
             book2.observe(self.pool(), 100.0)
-            self.assertEqual(book2.restarted, len(W.LP_RANGES))
+            self.assertEqual(book2.restarted, len(W.LP_RANGES) + len(W.LP_REBALANCE))
             for r in book2.summary():
                 self.assertLess(abs(r["fees_pct"]), 1)
                 self.assertEqual(r["hours"], 0.0)
@@ -972,7 +972,7 @@ class PoolEarningsTests(unittest.TestCase):
             for k, s in book2.sims.items():
                 self.assertEqual(s.t0, 0.0)
                 self.assertAlmostEqual(s.fee_quote, before[k] * 1.5, places=12)
-            self.assertEqual(len(book2.summary()), len(W.LP_RANGES))
+            self.assertEqual(len(book2.summary()), len(W.LP_RANGES) + len(W.LP_REBALANCE))
 
     def test_engine_feeds_positions_and_report_lists_them(self):
         with tempfile.TemporaryDirectory() as d:

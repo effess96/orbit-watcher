@@ -54,6 +54,8 @@ DOWNLOADS = {"dislocations.csv": "text/csv", "shocks.csv": "text/csv", "loops.cs
              "raw_updates.jsonl": "application/x-ndjson"}
 BUNDLE_FILES = ("dislocations.csv", "shocks.csv", "loops.csv", "closers.csv", "quote_checks.csv",
                 "lp_state.json", "latency.json", "regime.json", "regime_log.jsonl")
+STALL_ALERT_S = 600              # Telegram alert when no pool update arrives for this long
+MOOD_FAILS_ALERT = 3             # ...or when the market-mood job fails this many times in a row
 MOOD_EVERY_S = 6 * 3600          # market mood refresh (heavy fetches happen once a day; the rest hit the cache)
 ARCHIVE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 SECRET_IN_TEXT = re.compile(r"(api[-_]?key=)[^&\s\"']+|(bot)\d+:[A-Za-z0-9_-]+", re.I)
@@ -186,6 +188,7 @@ class App:
         self.hunter = {"last_check": None, "checked": 0, "recent": collections.deque(maxlen=12), "error": ""}
         self.hunt_seen: set[str] = set()
         self.last_daily = time.time()
+        self.last_archive = time.time()
         self.last_hunt = 0.0
         self.history: collections.deque = collections.deque(maxlen=720)   # 1 hour at 5-second samples
         self._rates = {"t": 0.0}
@@ -194,7 +197,8 @@ class App:
         self.raw_started = time.time()
         self.raw_lock = threading.Lock()
         self.mood: dict | None = None
-        self.mood_status = {"state": "waiting", "error": "", "last_try": None}
+        self.mood_status = {"state": "waiting", "error": "", "last_try": None, "fails": 0}
+        self.watchdog = {"updates": -1, "since": time.time(), "stalled": False, "mood_alerted": False}
         try:
             self.mood = json.loads((self.out / "regime.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -295,14 +299,14 @@ class App:
         self.history.append({"t": round(time.time(), 1), "updates": e.updates,
                              "lag": lat["median_slots"] if lat else None,
                              "gaps": {w.label: round(g, 4) for w in e.watches
-                                      if (g := e.max_gap_pct(w)) is not None},
+                                      if (g := e.max_gap_pct(w, active_only=True)) is not None},
                              "net": {w.label: round(g, 4) for w in e.watches
-                                     if (g := e.best_net_gap_pct(w)) is not None},
+                                     if (g := e.best_net_gap_pct(w, active_only=True)) is not None},
                              "gaps_seen": e.stats.get("dislocations", 0) + e.open_count(),
                              "tradable": e.stats.get("tradable", 0),
                              "shocks": e.stats.get("shocks", 0),
-                             "lp": {f"{r['pool']} ±{r['range_pct']}%": r["net_vs_hold_pct"] for r in rows},
-                             "lp_sol": {f"{r['pool']} ±{r['range_pct']}%": r["net_sol_per_day"] for r in rows
+                             "lp": {f"{r['pool']} ±{r['range_pct']}%" + (" auto" if r.get("strategy") == "rebalance" else ""): r["net_vs_hold_pct"] for r in rows},
+                             "lp_sol": {f"{r['pool']} ±{r['range_pct']}%" + (" auto" if r.get("strategy") == "rebalance" else ""): r["net_sol_per_day"] for r in rows
                                         if not r.get("early")},
                              "loop": {w.label: round(w.loop_best, 6) for w in e.watches if w.loop_best is not None}})
 
@@ -352,7 +356,11 @@ class App:
     def run_mood_once(self, data: "R.RegimeData | None" = None) -> dict:
         self.mood_status.update(state="fetching", last_try=time.time())
         data = data or R.RegimeData(self.out / "regime_cache", log=lambda m: print(m, flush=True))
-        result = R.analyse(data, R.watches_for_mood(self.config()))
+        watches = R.watches_for_mood(self.config())
+        result = R.analyse(data, watches)
+        result["safety"] = self.check_safety(watches)
+        for t in result["tokens"]:
+            t["safety"] = next((x for x in result["safety"] if x.get("mint") == t["mint"]), None)
         self.out.mkdir(parents=True, exist_ok=True)
         old = (self.mood or {}).get("composite", {}).get("zone")
         self.mood = result
@@ -364,13 +372,32 @@ class App:
             fh.write(json.dumps({"t": result["t"], "score": c.get("score"), "zone": c.get("zone"),
                                  "sol": result["sol"].get("price"), "sol_vol30": result["sol"].get("vol30"),
                                  "weather": {t["watch"]: [t["weather_5"], t["weather_20"]] for t in result["tokens"]}}) + "\n")
-        self.mood_status.update(state="ok", error="")
+        self.mood_status.update(state="ok", error="", fails=0)
+        self.watchdog["mood_alerted"] = False
         print(f"Market mood: {c.get('zone')} (score {c.get('score')}/100); "
               f"{result['requests']} requests in {result['seconds']} s", flush=True)
         if old and c.get("zone") != old:
             self.notifier.send(f"Orbit market mood changed: {old} -> {c.get('zone')} (score {c.get('score')}/100). "
                                "Descriptive only, not a trade signal.", force=True)
         return result
+
+    def check_safety(self, watches: list[dict]) -> list[dict]:
+        """On-chain token checks (mint/freeze authority, Token-2022 features, holder concentration). Read-only."""
+        url = getattr(self, "_http_url", None)
+        if not url:
+            return []
+        rpc = self.rpc_factory(url)
+        vaults: set[str] = set()
+        for w in (self.engine.watches if self.engine else []):
+            for p in w.pools:
+                vaults |= set(p.vault_side) | {v for v in (getattr(p, "base_vault", None), getattr(p, "quote_vault", None)) if v}
+        out = []
+        for w in watches:
+            try:
+                out.append({**W.token_safety(rpc, w["mint"], vaults), "watch": w["label"].strip()})
+            except Exception as e:
+                out.append({"mint": w["mint"], "watch": w["label"].strip(), "error": f"{type(e).__name__}"})
+        return out
 
     def _mood_loop(self, first_wait: float = 60) -> None:
         time.sleep(first_wait)
@@ -379,7 +406,8 @@ class App:
                 self.run_mood_once()
                 wait = MOOD_EVERY_S
             except Exception as e:
-                self.mood_status.update(state="error", error=f"{type(e).__name__}: {e}"[:200])
+                self.mood_status.update(state="error", error=f"{type(e).__name__}: {e}"[:200],
+                                        fails=self.mood_status.get("fails", 0) + 1)
                 print(f"Market mood: failed ({type(e).__name__}: {e}); retrying in 30 min", flush=True)
                 wait = 1800
             time.sleep(wait)
@@ -551,7 +579,8 @@ class App:
                 owner.setdefault(p.address, w.label)
             if w.ref:
                 owner.setdefault(w.ref.address, "SOL/USDC")
-        return [{**r, "watch": owner.get(r["address"], "?")} for r in e.lp.summary()]
+        # positions whose pool is no longer watched (the hunter's expired tokens) are dropped from the table
+        return [{**r, "watch": owner[r["address"]]} for r in e.lp.summary() if r["address"] in owner]
 
     def open_gaps(self) -> list[dict]:
         e, out = self.engine, []
@@ -666,10 +695,39 @@ class App:
         if self.notifier.enabled and time.time() - self.last_daily >= 86400:
             self.last_daily = time.time()
             self.notifier.send("Orbit daily summary\n" + "\n".join(W.report(self.out).splitlines()[2:16]), force=True)
+        self.check_health()
+        if time.time() - self.last_archive >= 86400:          # one automatic copy a day, no button needed
+            self.last_archive = time.time()
+            try:
+                self.save_archive("daily")
+            except Exception as err:
+                print(f"Daily archive failed: {err}", flush=True)
         raw = self.out / "raw_updates.jsonl"
         if self.recorder and self.recorder.raw_fh and raw.exists() and raw.stat().st_size > 0 and (
                 raw.stat().st_size > RAW_ROTATE_BYTES or time.time() - self.raw_started > RAW_ROTATE_HOURS * 3600):
             self.rotate_raw()
+
+    def check_health(self, now: float | None = None) -> None:
+        """Telegram 'trouble' alerts: data stream stalled, or the market-mood job keeps failing. Once each, plus
+        a recovery message."""
+        now = now or time.time()
+        wd, e = self.watchdog, self.engine
+        updates = e.updates if e else -1
+        if updates != wd["updates"]:
+            if wd["stalled"]:
+                self.notifier.send(f"Orbit recovered: pool updates are flowing again ({updates:,} so far).", force=True)
+                print("Watchdog: data flowing again.", flush=True)
+            wd.update(updates=updates, since=now, stalled=False)
+        elif not wd["stalled"] and now - wd["since"] >= STALL_ALERT_S:
+            wd["stalled"] = True
+            msg = (f"Orbit trouble: no pool updates for {int((now - wd['since']) / 60)} minutes (state: {self.state}). "
+                   "Check the dashboard; Railway may need a restart.")
+            self.notifier.send(msg, force=True)
+            print("Watchdog: " + msg, flush=True)
+        if self.mood_status.get("fails", 0) >= MOOD_FAILS_ALERT and not wd["mood_alerted"]:
+            wd["mood_alerted"] = True
+            self.notifier.send(f"Orbit trouble: market mood failed {self.mood_status['fails']} times in a row "
+                               f"({self.mood_status.get('error', '')}).", force=True)
 
     # -- auth -----------------------------------------------------------------
     def check_password(self, pw: str) -> bool:
@@ -713,12 +771,13 @@ class App:
                               "fee_editable": kind in ("cp", "clmm"), "liquidity_usd": pc.get("liquidity_usd"),
                               "adaptive_fee": lp.adaptive_fee if lp and lp.oracle else None,
                               "price": lp.price() if lp and lp.ready() else None,
-                              "suspect": bool(lp and lp.suspect)})
+                              "suspect": bool(lp and lp.suspect),
+                              "idle_min": round((time.time() - lp.last_update) / 60) if lp else None})
             ref = wc.get("sol_usdc")
             watches.append({"label": wc["label"], **settings, "pools": pools, "auto_until": wc.get("auto_until"),
                             "ref": ref["name"] if ref else None,
-                            "gap_pct": e.max_gap_pct(lw) if e and lw else None,
-                            "net_gap_pct": e.best_net_gap_pct(lw) if e and lw else None,
+                            "gap_pct": e.max_gap_pct(lw, active_only=True) if e and lw else None,
+                            "net_gap_pct": e.best_net_gap_pct(lw, active_only=True) if e and lw else None,
                             "open": len(lw.open) if lw else 0})
         return {
             "state": self.state, "uptime_s": round(time.time() - self.started),
@@ -726,7 +785,9 @@ class App:
             "stats": dict(e.stats) if e else {}, "watches": watches,
             "rpc": "private" if os.environ.get("SOLANA_RPC_HTTP") else "public",
             "latency": e.latency_stats() if e else None,
-            "lp": self.lp_rows(),
+            "lp": (lp := self.lp_rows()),
+            "lp_spread": W.lp_spread(lp),
+            "verdict": W.lp_verdict(lp)[1:],
             "mood": self.mood, "mood_status": self.mood_status,
             "audit": self.audit_summary(),
             "loops": self.loop_state(),

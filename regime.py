@@ -47,7 +47,7 @@ from scorer import COMPONENT_LABELS, COMPONENT_WEIGHTS, calculate_composite_scor
 COINGECKO = "https://api.coingecko.com/api/v3"
 BINANCE_FUNDING = "https://fapi.binance.com/fapi/v1/premiumIndex"
 OKX_FUNDING = "https://www.okx.com/api/v5/public/funding-rate?instId={sym}-USDT-SWAP"
-USER_AGENT = "orbit-watcher/1.3.1 (read-only research)"
+USER_AGENT = "orbit-watcher/1.4 (read-only research)"
 REQUEST_DELAY_S = 8.0          # CoinGecko's free tier allows roughly 5-15 requests a minute
 MAX_RETRIES = 4
 BACKOFF_BASE_S = 15
